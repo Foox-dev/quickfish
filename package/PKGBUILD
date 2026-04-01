@@ -1,0 +1,32 @@
+pkgname=sourcefish-git
+pkgver=r3.2c3c262
+pkgrel=1
+pkgdesc="A TUI filemanager designed to remove the need for GUI alternatives."
+arch=('x86_64')
+url="https://github.com/Foox-dev/sourcefish"
+license=('GPL2')
+depends=('ncurses')
+makedepends=('git' 'gcc' 'make')
+provides=('sourcefish')
+conflicts=('sourcefish')
+source=("git+$url")
+md5sums=('SKIP')
+options=('!debug')
+
+pkgver() {
+    cd "$srcdir/sourcefish"
+    echo "r$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"
+}
+
+build() {
+    cd "$srcdir/sourcefish"
+    make rel
+}
+
+package() {
+    cd "$srcdir/sourcefish"
+    make DESTDIR="$pkgdir" PREFIX="/usr" install
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 docs/sourcefish.1 "$pkgdir/usr/share/man/man1/sourcefish.1"
+}
