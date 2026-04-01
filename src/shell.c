@@ -20,20 +20,8 @@ typedef struct {
 // from clifm
 static const CmdLabel cmd_labels[] = {
     { "q", "quit" },
-    { "ls", "list" },
-    { "pwd", "working dir" },
-    { "mkdir", "create dir" },
-    { "rmdir", "remove dir" },
-    { "rm", "remove file" },
-    { "cp", "copy" },
-    { "mv", "move" },
-    { "touch", "touch" },
-    { "cat", "meow" },
-    { "echo", "echo" },
-    { "chmod", "change perm" },
-    { "curl", "curl" },
-    { "wget", "wget" },
-    { "swordfish", "no way!" },
+    { "swordfish", "it's my brother, no way!" },
+    { "s", "stat <file/index>" },
     { NULL, NULL }
 };
 
@@ -161,14 +149,14 @@ void shell_restore_ncurses(WINDOW *files_win, WINDOW *shell_win) {
     nodelay(stdscr, TRUE);
 
     if (files_win) keypad(files_win, TRUE);
-    if (shell_win)  keypad(shell_win, TRUE);
+    if (shell_win) keypad(shell_win, TRUE);
 
     curs_set(0);
     clearok(stdscr, TRUE);
     refresh();
 
     if (files_win) { clearok(files_win, TRUE); touchwin(files_win); }
-    if (shell_win)  { clearok(shell_win, TRUE); touchwin(shell_win); }
+    if (shell_win) { clearok(shell_win, TRUE); touchwin(shell_win); }
 }
 
 static void do_spawn(const char *cwd, WINDOW *files_win, WINDOW *shell_win) {
@@ -210,7 +198,7 @@ static void run_shell(const char *cmd, const char *cwd, ShellBuffer *shell) {
         dup2(pfd[1], STDERR_FILENO);
         close(pfd[1]);
         if (cwd && cwd[0]) chdir(cwd);
-        signal(SIGINT,  SIG_DFL);
+        signal(SIGINT, SIG_DFL);
         signal(SIGQUIT, SIG_DFL);
         signal(SIGTSTP, SIG_DFL);
         execlp(sh, sh, "-c", cmd, (char *)NULL);
@@ -246,7 +234,7 @@ void shell_open_file(const char *path, WINDOW *files_win, WINDOW *shell_win) {
         endwin();
         pid_t pid = fork();
         if (pid == 0) {
-            signal(SIGINT,  SIG_DFL);
+            signal(SIGINT, SIG_DFL);
             signal(SIGQUIT, SIG_DFL);
             signal(SIGTSTP, SIG_DFL);
             execlp(editor, editor, path, (char *)NULL);
@@ -265,7 +253,7 @@ void shell_open_file(const char *path, WINDOW *files_win, WINDOW *shell_win) {
     endwin();
     pid_t pid = fork();
     if (pid == 0) {
-        signal(SIGINT,  SIG_DFL);
+        signal(SIGINT, SIG_DFL);
         signal(SIGQUIT, SIG_DFL);
         signal(SIGTSTP, SIG_DFL);
         execlp(pager, pager, path, (char *)NULL);
@@ -286,6 +274,12 @@ static const char *parse_cd(const char *cmd) {
     return after;
 }
 
+int print_to_shell(ShellBuffer *shell, const char *given) {
+    strncpy(shell->last_output, given, SHELL_OUTPUT_MAX -1);
+    shell->last_output[SHELL_OUTPUT_MAX -1] = '\0';    
+    return 0;
+}
+
 int execute_given(ShellBuffer *shell, FilesBuffer *files,
                   WINDOW *files_win, WINDOW *shell_win) {
     char cmd[SHELL_MAX_INPUT];
@@ -297,7 +291,7 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files,
         cmd[--len] = '\0';
 
     memset(shell->current_input, 0, SHELL_MAX_INPUT);
-    shell->input_pos     = 0;
+    shell->input_pos = 0;
     shell->history_index = -1;
 
     if (len == 0) {
@@ -318,11 +312,18 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files,
 
     shell_add_history(shell, cmd);
 
+    // custom
     if (strcmp(cmd, "q") == 0) {
         shell->quit_requested = 1;
         return 0;
     }
 
+    if (cmd[0] == 's' && (cmd[1] == '\0' || cmd[1] == ' ')) {
+        files_cmd_stat(files, shell, cmd[1] == ' ' ? cmd + 2 : "");
+        return 0;
+    }
+
+    // cd <index or path>
     const char *cd_arg = parse_cd(cmd);
     if (cd_arg != NULL) {
         char target[PATH_MAX];
@@ -365,6 +366,43 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files,
         return 1;
     }
 
+    // rm <index> — remove entry by index, rm -rf if dir
+    {
+        const char *p = cmd;
+        while (*p == ' ' || *p == '\t') p++;
+
+        if (strncmp(p, "rm", 2) == 0 && (p[2] == ' ' || p[2] == '\t')) {
+            const char *arg = p + 2;
+            while (*arg == ' ' || *arg == '\t') arg++;
+
+            char *endp;
+            long idx = strtol(arg, &endp, 10);
+            if (*endp == '\0' && idx > 0) {
+                int found = 0;
+                for (int i = 0; i < files->entry_count; i++) {
+                    if (files->entries[i].index != (int)idx) continue;
+
+                    char entry_path[PATH_MAX];
+                    if (strcmp(files->cwd, "/") == 0)
+                        snprintf(entry_path, PATH_MAX, "/%s", files->entries[i].name);
+                    else
+                        path_join(entry_path, PATH_MAX, files->cwd, files->entries[i].name);
+
+                    char rm_cmd[PATH_MAX + 16];
+                    if (files->entries[i].type == ENTRY_DIR)
+                        snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", entry_path);
+                    else
+                        snprintf(rm_cmd, sizeof(rm_cmd), "rm '%s'", entry_path);
+
+                    run_shell(rm_cmd, files->cwd, shell);
+                    found = 1;
+                    break;
+                }
+                if (found) return 0;
+            }
+        }
+    }
+
     run_shell(cmd, files->cwd, shell);
     return 0;
 }
@@ -389,6 +427,8 @@ void compute_ghost(const char *input, int input_pos, const char *cwd,
     int is_first_token = (tok_start == 0);
     int has_slash = (strchr(token, '/') != NULL);
 
+    if (!is_first_token) return;
+
     if (is_first_token && !has_slash) {
         for (int i = 0; cmd_labels[i].cmd != NULL; i++) {
             if (strcmp(cmd_labels[i].cmd, token) == 0) {
@@ -398,8 +438,6 @@ void compute_ghost(const char *input, int input_pos, const char *cwd,
         }
         return;
     }
-
-    if (!is_first_token) return;
 
     char dir_part[PATH_MAX];
     char name_part[MAX_FILENAME];
@@ -449,8 +487,7 @@ void shell_render(ShellBuffer *shell, WINDOW *win, int height, int focused, cons
         wattron(win, COLOR_PAIR(CP_TITLE_F) | A_BOLD);
         mvwprintw(win, 0, 0, " SHELL ");
         wattroff(win, COLOR_PAIR(CP_TITLE_F) | A_BOLD);
-        mvwprintw(win, 0, 8,
-            " Enter: spawn shell q: quit");
+        mvwprintw(win, 0, 8, " Enter: spawn shell q: quit");
     } else {
         wattron(win, COLOR_PAIR(CP_TITLE_UF) | A_BOLD);
         mvwprintw(win, 0, 0, " SHELL ");

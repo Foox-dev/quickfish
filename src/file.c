@@ -1,11 +1,16 @@
+#define _GNU_SOURCE
+
 #include <dirent.h>
 #include <sys/stat.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <time.h>
+#include <ftw.h>
 
 #include "file.h"
+#include "shell.h"
 #include "main.h"
 
 #define INDEX_W 4
@@ -164,6 +169,28 @@ int files_get_selected_path(FilesBuffer *files, char *out_path, size_t out_size)
     return (e->type == ENTRY_DIR) ? 0 : 1;
 }
 
+static off_t dir_size_total;
+
+static int dir_size_walk(const char *path, const struct stat *st, int type, struct FTW *ftw) {
+    (void)path; (void)type; (void)ftw;
+    dir_size_total += st->st_blocks * 512;
+    return 0;
+}
+
+static off_t compute_dir_size(const char *path) {
+    dir_size_total = 0;
+    nftw(path, dir_size_walk, 64, FTW_PHYS);
+    return dir_size_total;
+}
+
+void refresh_files_buffer(FilesBuffer *files) {
+    int saved_sel = files->selected;
+    int saved_offset = files->col_offset;
+    files_load_directory(files, files->cwd);
+    files->selected = (saved_sel < files->entry_count) ? saved_sel : 0;
+    files->col_offset = saved_offset;
+}
+
 void files_render(FilesBuffer *files, WINDOW *win, int height, int width, int focused) {
     int rows = height - 1;
     if (rows <= 0 || width <= 0) return;
@@ -189,6 +216,57 @@ void files_render(FilesBuffer *files, WINDOW *win, int height, int width, int fo
             wattron(win, A_BOLD);
             mvwprintw(win, 0, 8, " %.*s", avail, cwd);
             wattroff(win, A_BOLD);
+        }
+
+        char count_str[32];
+        snprintf(count_str, sizeof(count_str), " %d i ", files->entry_count);
+        int cx = width - (int)strlen(count_str);
+        if (cx > 0)
+            mvwprintw(win, 0, cx, "%s", count_str);
+    }
+
+    if (files->entry_count > 0) {
+        DirEntry *sel = &files->entries[files->selected];
+        char full[PATH_MAX];
+        path_join(full, sizeof(full), files->cwd, sel->name);
+
+        struct stat st;
+        if (stat(full, &st) == 0) {
+            char perms[11];
+            perms[0] = S_ISDIR(st.st_mode) ? 'd' : '-';
+            perms[1] = (st.st_mode & S_IRUSR) ? 'r' : '-';
+            perms[2] = (st.st_mode & S_IWUSR) ? 'w' : '-';
+            perms[3] = (st.st_mode & S_IXUSR) ? 'x' : '-';
+            perms[4] = (st.st_mode & S_IRGRP) ? 'r' : '-';
+            perms[5] = (st.st_mode & S_IWGRP) ? 'w' : '-';
+            perms[6] = (st.st_mode & S_IXGRP) ? 'x' : '-';
+            perms[7] = (st.st_mode & S_IROTH) ? 'r' : '-';
+            perms[8] = (st.st_mode & S_IWOTH) ? 'w' : '-';
+            perms[9] = (st.st_mode & S_IXOTH) ? 'x' : '-';
+            perms[10] = '\0';
+
+            char size_str[32];
+            off_t sz = st.st_size;
+            if (S_ISDIR(st.st_mode)) {
+                snprintf(size_str, sizeof(size_str), "-");
+            } else if (sz >= 1024 * 1024 * 1024) {
+                snprintf(size_str, sizeof(size_str), "%.1fG", (double)sz / (1024*1024*1024));
+            } else if (sz >= 1024 * 1024) {
+                snprintf(size_str, sizeof(size_str), "%.1fM", (double)sz / (1024*1024));
+            } else if (sz >= 1024) {
+                snprintf(size_str, sizeof(size_str), "%.1fK", (double)sz / 1024);
+            } else {
+                snprintf(size_str, sizeof(size_str), "%ldB", (long)sz);
+            }
+
+            char info[64];
+            snprintf(info, sizeof(info), " %s %s ", perms, size_str);
+            int ix = width - (int)strlen(info);
+            if (ix > 0) {
+                wattron(win, A_DIM);
+                mvwprintw(win, rows, ix, "%s", info);
+                wattroff(win, A_DIM);
+            }
         }
     }
 
@@ -221,10 +299,10 @@ void files_render(FilesBuffer *files, WINDOW *win, int height, int width, int fo
             if (idx >= files->entry_count) break;
 
             DirEntry *e = &files->entries[idx];
-            int y   = row + 1;
+            int y = row + 1;
             int sel = (idx == files->selected);
 
-            wmove(win, y, x);
+            wmove(win, y, x+1);
 
             if (sel)
                 wattron(win, COLOR_PAIR(CP_SELECTED) | A_BOLD);
@@ -263,9 +341,116 @@ void files_render(FilesBuffer *files, WINDOW *win, int height, int width, int fo
     }
 
     if (files->col_offset > 0)
-        mvwprintw(win, 1, 0, "<");
+        mvwprintw(win, 1, 0, "< ");
     if (files->col_offset + n_cols < total_cols)
         mvwprintw(win, 1, width - 1, ">");
 
     wnoutrefresh(win);
 }
+
+void files_cmd_stat(FilesBuffer *files, struct ShellBuffer *shell, const char *arg) {
+    if (!arg || arg[0] == '\0') {
+        print_to_shell(shell, "stat: no file specified\n");
+        return;
+    }
+
+    char full[PATH_MAX];
+    DirEntry *e = NULL;
+    DirEntry  synthetic = {0};
+
+    if (arg[0] == '~') {
+        const char *home = getenv("HOME");
+        if (!home) home = "/";
+        if (arg[1] == '/' || arg[1] == '\0')
+            snprintf(full, sizeof full, "%s%s", home, arg + 1);
+        else
+            snprintf(full, sizeof full, "%s", arg);
+        const char *base = strrchr(full, '/');
+        strncpy(synthetic.name, base ? base + 1 : full, MAX_FILENAME - 1);
+        e = &synthetic;
+    } else if (strchr(arg, '/')) {
+        if (arg[0] == '/')
+            snprintf(full, sizeof full, "%s", arg);
+        else
+            path_join(full, sizeof full, files->cwd, arg);
+        const char *base = strrchr(full, '/');
+        strncpy(synthetic.name, base ? base + 1 : full, MAX_FILENAME - 1);
+        e = &synthetic;
+    } else {
+        char *end;
+        long idx = strtol(arg, &end, 10);
+        if (*end == '\0') {
+            for (int i = 0; i < files->entry_count; i++)
+                if (files->entries[i].index == (int)idx) { e = &files->entries[i]; break; }
+        } else {
+            for (int i = 0; i < files->entry_count; i++)
+                if (strcasecmp(files->entries[i].name, arg) == 0) { e = &files->entries[i]; break; }
+        }
+
+        if (!e) {
+            char msg[128];
+            snprintf(msg, sizeof msg, "stat: '%s' not found in current directory\n", arg);
+            print_to_shell(shell, msg);
+            return;
+        }
+        path_join(full, sizeof full, files->cwd, e->name);
+    }
+
+    struct stat st;
+    if (stat(full, &st) != 0) {
+        char msg[MAX_FILENAME + 32];
+        snprintf(msg, sizeof msg, "stat: could not stat '%s'\n", e->name);
+        print_to_shell(shell, msg);
+        return;
+    }
+
+    char perms[11];
+    perms[0] = S_ISDIR(st.st_mode) ? 'd' : '-';
+    perms[1] = (st.st_mode & S_IRUSR) ? 'r' : '-';
+    perms[2] = (st.st_mode & S_IWUSR) ? 'w' : '-';
+    perms[3] = (st.st_mode & S_IXUSR) ? 'x' : '-';
+    perms[4] = (st.st_mode & S_IRGRP) ? 'r' : '-';
+    perms[5] = (st.st_mode & S_IWGRP) ? 'w' : '-';
+    perms[6] = (st.st_mode & S_IXGRP) ? 'x' : '-';
+    perms[7] = (st.st_mode & S_IROTH) ? 'r' : '-';
+    perms[8] = (st.st_mode & S_IWOTH) ? 'w' : '-';
+    perms[9] = (st.st_mode & S_IXOTH) ? 'x' : '-';
+    perms[10] = '\0';
+
+    off_t sz = S_ISDIR(st.st_mode) ? compute_dir_size(full) : st.st_size;
+
+    char size_str[32];
+    if (sz >= 1024 * 1024 * 1024)
+        snprintf(size_str, sizeof size_str, "%.1fG", (double)sz / (1024*1024*1024));
+    else if (sz >= 1024 * 1024)
+        snprintf(size_str, sizeof size_str, "%.1fM", (double)sz / (1024*1024));
+    else if (sz >= 1024)
+        snprintf(size_str, sizeof size_str, "%.1fK", (double)sz / 1024);
+    else
+        snprintf(size_str, sizeof size_str, "%ldB", (long)sz);
+
+    char time_str[32];
+    struct tm *tm = localtime(&st.st_mtime);
+    strftime(time_str, sizeof time_str, "%Y-%m-%d %H:%M", tm);
+
+    char out[512];
+    snprintf(out, sizeof out,
+        "name: %s\n"
+        "type: %s\n"
+        "perms: %s\n"
+        "size: %s\n"
+        "modified: %s\n"
+        "inode: %lu\n"
+        "links: %lu\n",
+        e->name,
+        S_ISDIR(st.st_mode) ? "directory" : "file",
+        perms,
+        size_str,
+        time_str,
+        (unsigned long)st.st_ino,
+        (unsigned long)st.st_nlink
+    );
+
+    print_to_shell(shell, out);
+}
+

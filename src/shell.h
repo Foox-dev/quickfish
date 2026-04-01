@@ -1,5 +1,4 @@
-#ifndef SHELL_H
-#define SHELL_H
+#pragma once
 
 #include <ncurses.h>
 #include "file.h"
@@ -10,7 +9,7 @@
 #define SHELL_OUTPUT_MAX 8192
 #define SHELL_RESULT_MAX 128
 
-typedef struct {
+typedef struct ShellBuffer {
     char history[SHELL_MAX_HIST][SHELL_MAX_INPUT];
     int history_count;
     int history_index;
@@ -34,5 +33,4 @@ void shell_render(ShellBuffer *shell, WINDOW *win, int height,
 
 void compute_ghost(const char *input, int input_pos, const char *cwd,
                    char *ghost_out, int ghost_max);
-
-#endif
+int print_to_shell(ShellBuffer *shell, const char *given);

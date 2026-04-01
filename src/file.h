@@ -27,6 +27,8 @@ typedef struct {
     char cwd[PATH_MAX];
 } FilesBuffer;
 
+struct ShellBuffer;
+
 void files_load_directory(FilesBuffer *files, const char *path);
 void files_sort_entries(FilesBuffer *files);
 void files_select_next(FilesBuffer *files);
@@ -38,3 +40,5 @@ int  files_get_selected_path(FilesBuffer *files, char *out_path, size_t out_size
 void files_render(FilesBuffer *files, WINDOW *win, int height, int width, int focused);
 
 int complete_in_dir(const char *dir, const char *prefix, char *out, int out_size);
+void files_cmd_stat(FilesBuffer *files, struct ShellBuffer *shell, const char *arg);
+void refresh_files_buffer(FilesBuffer *files);
