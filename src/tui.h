@@ -1,5 +1,4 @@
-#ifndef TUI_H
-#define TUI_H
+#pragma once
 
 #include <ncurses.h>
 #include <stdlib.h>
@@ -15,12 +14,14 @@ typedef enum {
     BUFFER_FILES,
     BUFFER_SHELL,
     BUFFER_PREVIEW,
+    BUFFER_INFO,
 } BufferType;
 
 typedef struct {
     FilesBuffer files;
     ShellBuffer shell;
     BufferType active_buffer;
+    BufferType prev_buffer;
     WINDOW *files_win;
     WINDOW *shell_win;
 
@@ -35,7 +36,7 @@ typedef struct {
     char goto_buf[GOTO_BUF_MAX];
     int goto_len;
     int rename_mode;
-    char rename_buf[MAX_FILENAME];
+    char rename_buf[RENAME_BUF_MAX];
     int rename_len;
     int rename_cursor;
 
@@ -57,5 +58,3 @@ void tui_handle_input(TUI *tui, int ch);
 void tui_handle_files_input(TUI *tui, int ch);
 void tui_handle_preview_input(TUI *tui, int ch);
 void tui_handle_shell_input(TUI *tui, int ch);
-
-#endif

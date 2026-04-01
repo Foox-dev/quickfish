@@ -3,7 +3,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <sys/wait.h>
 #include <stdio.h>
 #include <limits.h>
@@ -13,11 +12,11 @@ typedef struct {
     const char *label;
 } CmdLabel;
 
-// result ghosts that show the result of a command.
+// result ghosts that show the result of a command
 // We do this since we will create custom commands that are
 // non standerd and this will be a good way to show the user
 // what something does (plus it's cool!). I got this idea
-// from clifm
+// from clifm  
 static const CmdLabel cmd_labels[] = {
     { "q", "quit" },
     { "swordfish", "it's my brother, no way!" },
@@ -37,19 +36,62 @@ static const char *lookup_label(const char *cmd) {
     return NULL;
 }
 
+static void jumplist_push(ShellBuffer *shell, const char *path) {
+    if (shell->dir_jumplist_count < DIR_JUMPLIST_MAX) {
+        strncpy(shell->dir_jumplist[shell->dir_jumplist_count], path, PATH_MAX - 1);
+        shell->dir_jumplist[shell->dir_jumplist_count][PATH_MAX - 1] = '\0';
+        shell->dir_jumplist_count++;
+    }
+}
+
 void shell_add_history(ShellBuffer *shell, const char *cmd) {
-    if (shell->history_count >= SHELL_MAX_HIST) return;
+    if (shell->history_count > 0 &&
+        strcmp(shell->history[shell->history_count - 1], cmd) == 0)
+        return;
+    if (shell->history_count >= SHELL_MAX_HIST) {
+        memmove(shell->history[0], shell->history[1],
+                (size_t)(SHELL_MAX_HIST - 1) * SHELL_MAX_INPUT);
+        shell->history_count = SHELL_MAX_HIST - 1;
+    }
     strncpy(shell->history[shell->history_count], cmd, SHELL_MAX_INPUT - 1);
     shell->history[shell->history_count][SHELL_MAX_INPUT - 1] = '\0';
     shell->history_count++;
 }
 
 void shell_handle_char(ShellBuffer *shell, int ch) {
+    int len = (int)strlen(shell->current_input);
+
     if (ch == '\x7f' || ch == KEY_BACKSPACE) {
         if (shell->input_pos > 0) {
+            memmove(shell->current_input + shell->input_pos - 1,
+                    shell->current_input + shell->input_pos,
+                    (size_t)(len - shell->input_pos + 1));
             shell->input_pos--;
-            shell->current_input[shell->input_pos] = '\0';
         }
+        return;
+    }
+    if (ch == KEY_DC) {
+        if (shell->input_pos < len) {
+            memmove(shell->current_input + shell->input_pos,
+                    shell->current_input + shell->input_pos + 1,
+                    (size_t)(len - shell->input_pos));
+        }
+        return;
+    }
+    if (ch == KEY_LEFT) {
+        if (shell->input_pos > 0) shell->input_pos--;
+        return;
+    }
+    if (ch == KEY_RIGHT) {
+        if (shell->input_pos < len) shell->input_pos++;
+        return;
+    }
+    if (ch == KEY_HOME) {
+        shell->input_pos = 0;
+        return;
+    }
+    if (ch == KEY_END) {
+        shell->input_pos = len;
         return;
     }
     if (ch == KEY_UP) {
@@ -76,9 +118,11 @@ void shell_handle_char(ShellBuffer *shell, int ch) {
         }
         return;
     }
-    if (ch >= 32 && ch < 127 && shell->input_pos < SHELL_MAX_INPUT - 1) {
+    if (ch >= 32 && ch < 127 && len < SHELL_MAX_INPUT - 1) {
+        memmove(shell->current_input + shell->input_pos + 1,
+                shell->current_input + shell->input_pos,
+                (size_t)(len - shell->input_pos + 1));
         shell->current_input[shell->input_pos++] = (char)ch;
-        shell->current_input[shell->input_pos] = '\0';
     }
 }
 
@@ -169,7 +213,7 @@ static void do_spawn(const char *cwd, WINDOW *files_win, WINDOW *shell_win) {
     pid_t pid = fork();
     if (pid == 0) {
         if (cwd && cwd[0]) chdir(cwd);
-        signal(SIGINT,  SIG_DFL);
+        signal(SIGINT, SIG_DFL);
         signal(SIGQUIT, SIG_DFL);
         signal(SIGTSTP, SIG_DFL);
         execlp(sh, sh, (char *)NULL);
@@ -226,45 +270,6 @@ static void run_shell(const char *cmd, const char *cwd, ShellBuffer *shell) {
     }
 }
 
-void shell_open_file(const char *path, WINDOW *files_win, WINDOW *shell_win) {
-    const char *editor = getenv("VISUAL");
-    if (!editor || editor[0] == '\0') editor = getenv("EDITOR");
-    if (editor && editor[0] != '\0') {
-        def_prog_mode();
-        endwin();
-        pid_t pid = fork();
-        if (pid == 0) {
-            signal(SIGINT, SIG_DFL);
-            signal(SIGQUIT, SIG_DFL);
-            signal(SIGTSTP, SIG_DFL);
-            execlp(editor, editor, path, (char *)NULL);
-            _exit(127);
-        } else if (pid > 0) {
-            int status;
-            waitpid(pid, &status, 0);
-        }
-        shell_restore_ncurses(files_win, shell_win);
-        return;
-    }
-
-    const char *pager = getenv("PAGER");
-    if (!pager || pager[0] == '\0') pager = "less";
-    def_prog_mode();
-    endwin();
-    pid_t pid = fork();
-    if (pid == 0) {
-        signal(SIGINT, SIG_DFL);
-        signal(SIGQUIT, SIG_DFL);
-        signal(SIGTSTP, SIG_DFL);
-        execlp(pager, pager, path, (char *)NULL);
-        _exit(127);
-    } else if (pid > 0) {
-        int status;
-        waitpid(pid, &status, 0);
-    }
-    shell_restore_ncurses(files_win, shell_win);
-}
-
 static const char *parse_cd(const char *cmd) {
     while (*cmd == ' ' || *cmd == '\t') cmd++;
     if (strncmp(cmd, "cd", 2) != 0) return NULL;
@@ -275,8 +280,8 @@ static const char *parse_cd(const char *cmd) {
 }
 
 int print_to_shell(ShellBuffer *shell, const char *given) {
-    strncpy(shell->last_output, given, SHELL_OUTPUT_MAX -1);
-    shell->last_output[SHELL_OUTPUT_MAX -1] = '\0';    
+    strncpy(shell->last_output, given, SHELL_OUTPUT_MAX - 1);
+    shell->last_output[SHELL_OUTPUT_MAX - 1] = '\0';
     return 0;
 }
 
@@ -312,7 +317,6 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files,
 
     shell_add_history(shell, cmd);
 
-    // custom
     if (strcmp(cmd, "q") == 0) {
         shell->quit_requested = 1;
         return 0;
@@ -323,7 +327,43 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files,
         return 0;
     }
 
-    // cd <index or path>
+    if (strcmp(cmd, "..") == 0) {
+        if (shell->dir_jumplist_count > 0) {
+            const char *prev = shell->dir_jumplist[--shell->dir_jumplist_count];
+            const char *slash = strrchr(prev, '/');
+            const char *dname = (slash && slash[1] != '\0') ? slash + 1 : prev;
+            strncpy(shell->last_result, dname, SHELL_RESULT_MAX - 1);
+            shell->last_result[SHELL_RESULT_MAX - 1] = '\0';
+            files_load_directory(files, prev);
+        }
+        return 1;
+    }
+
+    {
+        char *endp;
+        long idx = strtol(cmd, &endp, 10);
+        if (*endp == '\0' && idx > 0) {
+            for (int i = 0; i < files->entry_count; i++) {
+                if (files->entries[i].index == (int)idx &&
+                    files->entries[i].type == ENTRY_DIR) {
+                    char target[PATH_MAX];
+                    if (strcmp(files->cwd, "/") == 0)
+                        snprintf(target, PATH_MAX, "/%.*s",
+                                 (int)(PATH_MAX - 2), files->entries[i].name);
+                    else
+                        path_join(target, PATH_MAX, files->cwd, files->entries[i].name);
+                    jumplist_push(shell, files->cwd);
+                    strncpy(shell->last_result, files->entries[i].name, SHELL_RESULT_MAX - 1);
+                    shell->last_result[SHELL_RESULT_MAX - 1] = '\0';
+                    char resolved[PATH_MAX];
+                    const char *use = realpath(target, resolved) ? resolved : target;
+                    files_load_directory(files, use);
+                    return 1;
+                }
+            }
+        }
+    }
+
     const char *cd_arg = parse_cd(cmd);
     if (cd_arg != NULL) {
         char target[PATH_MAX];
@@ -362,43 +402,139 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files,
 
         char resolved[PATH_MAX];
         const char *use = realpath(target, resolved) ? resolved : target;
+        jumplist_push(shell, files->cwd);
         files_load_directory(files, use);
         return 1;
     }
 
-    // rm <index> — remove entry by index, rm -rf if dir
     {
         const char *p = cmd;
         while (*p == ' ' || *p == '\t') p++;
 
-        if (strncmp(p, "rm", 2) == 0 && (p[2] == ' ' || p[2] == '\t')) {
-            const char *arg = p + 2;
+        /* Match both "rm <args>" and "r <args>" as remove shorthand */
+        int is_rm = (strncmp(p, "rm", 2) == 0 && (p[2] == ' ' || p[2] == '\t'));
+        int is_r  = (p[0] == 'r' && p[1] == ' ');
+
+        if (is_rm || is_r) {
+            const char *arg = p + (is_rm ? 2 : 1);
             while (*arg == ' ' || *arg == '\t') arg++;
 
-            char *endp;
-            long idx = strtol(arg, &endp, 10);
-            if (*endp == '\0' && idx > 0) {
-                int found = 0;
-                for (int i = 0; i < files->entry_count; i++) {
-                    if (files->entries[i].index != (int)idx) continue;
+            if (!shell->rm_confirm_mode) {
+                /* --- Phase 1: collect targets and ask for confirmation --- */
+                char display[SHELL_OUTPUT_MAX];
+                int dlen = 0;
+                int any = 0;
+                const char *scan = arg;
 
-                    char entry_path[PATH_MAX];
-                    if (strcmp(files->cwd, "/") == 0)
-                        snprintf(entry_path, PATH_MAX, "/%s", files->entries[i].name);
-                    else
-                        path_join(entry_path, PATH_MAX, files->cwd, files->entries[i].name);
+                dlen += snprintf(display + dlen, sizeof(display) - dlen,
+                                 "File(s) to be removed:\n");
 
-                    char rm_cmd[PATH_MAX + 16];
-                    if (files->entries[i].type == ENTRY_DIR)
-                        snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", entry_path);
-                    else
-                        snprintf(rm_cmd, sizeof(rm_cmd), "rm '%s'", entry_path);
+                while (*scan != '\0' && dlen < (int)sizeof(display) - 1) {
+                    const char *tok_end = scan;
+                    while (*tok_end && *tok_end != ' ' && *tok_end != '\t') tok_end++;
 
-                    run_shell(rm_cmd, files->cwd, shell);
-                    found = 1;
-                    break;
+                    char token[MAX_FILENAME];
+                    int tok_len = (int)(tok_end - scan);
+                    if (tok_len >= MAX_FILENAME) tok_len = MAX_FILENAME - 1;
+                    strncpy(token, scan, tok_len);
+                    token[tok_len] = '\0';
+
+                    scan = tok_end;
+                    while (*scan == ' ' || *scan == '\t') scan++;
+
+                    int matched = 0;
+                    char *endp;
+                    long idx = strtol(token, &endp, 10);
+                    if (*endp == '\0' && idx > 0) {
+                        for (int i = 0; i < files->entry_count; i++) {
+                            if (files->entries[i].index != (int)idx) continue;
+                            dlen += snprintf(display + dlen, sizeof(display) - dlen,
+                                             "  %s\n", files->entries[i].name);
+                            any = 1;
+                            matched = 1;
+                            break;
+                        }
+                    }
+                    if (!matched) {
+                        for (int i = 0; i < files->entry_count; i++) {
+                            if (strcmp(files->entries[i].name, token) != 0) continue;
+                            dlen += snprintf(display + dlen, sizeof(display) - dlen,
+                                             "  %s\n", files->entries[i].name);
+                            any = 1;
+                            break;
+                        }
+                    }
                 }
-                if (found) return 0;
+
+                if (any) {
+                    snprintf(display + dlen, sizeof(display) - dlen,
+                             "Continue? [y/N]");
+                    print_to_shell(shell, display);
+                    shell->rm_confirm_mode = 1;
+                    strncpy(shell->rm_pending_cmd, cmd, SHELL_MAX_INPUT - 1);
+                    shell->rm_pending_cmd[SHELL_MAX_INPUT - 1] = '\0';
+                    return 0;
+                }
+                /* no targets matched — fall through to raw shell */
+            } else {
+                /* --- Phase 2: confirmed — execute the deletions --- */
+                shell->rm_confirm_mode = 0;
+                int any = 0;
+                while (*arg != '\0') {
+                    const char *tok_end = arg;
+                    while (*tok_end && *tok_end != ' ' && *tok_end != '\t') tok_end++;
+
+                    char token[MAX_FILENAME];
+                    int tok_len = (int)(tok_end - arg);
+                    if (tok_len >= MAX_FILENAME) tok_len = MAX_FILENAME - 1;
+                    strncpy(token, arg, tok_len);
+                    token[tok_len] = '\0';
+
+                    arg = tok_end;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+
+                    int matched = 0;
+                    char *endp;
+                    long idx = strtol(token, &endp, 10);
+                    if (*endp == '\0' && idx > 0) {
+                        for (int i = 0; i < files->entry_count; i++) {
+                            if (files->entries[i].index != (int)idx) continue;
+                            char entry_path[PATH_MAX];
+                            if (strcmp(files->cwd, "/") == 0)
+                                snprintf(entry_path, PATH_MAX, "/%s", files->entries[i].name);
+                            else
+                                path_join(entry_path, PATH_MAX, files->cwd, files->entries[i].name);
+                            char rm_cmd[PATH_MAX + 16];
+                            if (files->entries[i].type == ENTRY_DIR)
+                                snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", entry_path);
+                            else
+                                snprintf(rm_cmd, sizeof(rm_cmd), "rm '%s'", entry_path);
+                            run_shell(rm_cmd, files->cwd, shell);
+                            any = 1;
+                            matched = 1;
+                            break;
+                        }
+                    }
+                    if (!matched) {
+                        for (int i = 0; i < files->entry_count; i++) {
+                            if (strcmp(files->entries[i].name, token) != 0) continue;
+                            char entry_path[PATH_MAX];
+                            if (strcmp(files->cwd, "/") == 0)
+                                snprintf(entry_path, PATH_MAX, "/%s", files->entries[i].name);
+                            else
+                                path_join(entry_path, PATH_MAX, files->cwd, files->entries[i].name);
+                            char rm_cmd[PATH_MAX + 16];
+                            if (files->entries[i].type == ENTRY_DIR)
+                                snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", entry_path);
+                            else
+                                snprintf(rm_cmd, sizeof(rm_cmd), "rm '%s'", entry_path);
+                            run_shell(rm_cmd, files->cwd, shell);
+                            any = 1;
+                            break;
+                        }
+                    }
+                }
+                if (any) return 0;
             }
         }
     }
@@ -408,7 +544,8 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files,
 }
 
 void compute_ghost(const char *input, int input_pos, const char *cwd,
-                           char *ghost_out, int ghost_max) {
+                   const FilesBuffer *files, const ShellBuffer *shell,
+                   char *ghost_out, int ghost_max) {
     ghost_out[0] = '\0';
     if (input_pos <= 0 || !cwd) return;
 
@@ -430,6 +567,28 @@ void compute_ghost(const char *input, int input_pos, const char *cwd,
     if (!is_first_token) return;
 
     if (is_first_token && !has_slash) {
+        if (strcmp(token, "..") == 0) {
+            if (shell && shell->dir_jumplist_count > 0) {
+                const char *prev = shell->dir_jumplist[shell->dir_jumplist_count - 1];
+                const char *slash = strrchr(prev, '/');
+                const char *dname = (slash && slash[1] != '\0') ? slash + 1 : prev;
+                snprintf(ghost_out, ghost_max, " > %s", dname);
+            }
+            return;
+        }
+
+        char *endp;
+        long idx = strtol(token, &endp, 10);
+        if (*endp == '\0' && idx > 0 && files) {
+            for (int i = 0; i < files->entry_count; i++) {
+                if (files->entries[i].index == (int)idx &&
+                    files->entries[i].type == ENTRY_DIR) {
+                    snprintf(ghost_out, ghost_max, " > %s", files->entries[i].name);
+                    return;
+                }
+            }
+        }
+
         for (int i = 0; cmd_labels[i].cmd != NULL; i++) {
             if (strcmp(cmd_labels[i].cmd, token) == 0) {
                 snprintf(ghost_out, ghost_max, " > %s", cmd_labels[i].label);
@@ -479,7 +638,7 @@ void compute_ghost(const char *input, int input_pos, const char *cwd,
     ghost_out[ghost_max - 1] = '\0';
 }
 
-void shell_render(ShellBuffer *shell, WINDOW *win, int height, int focused, const char *cwd) {
+void shell_render(ShellBuffer *shell, WINDOW *win, int height, int focused, const char *cwd, const FilesBuffer *files) {
     int width = getmaxx(win);
     werase(win);
 
@@ -539,12 +698,30 @@ void shell_render(ShellBuffer *shell, WINDOW *win, int height, int focused, cons
     mvwaddstr(win, input_row, 1, "> ");
     wattroff(win, COLOR_PAIR(CP_PROMPT) | A_BOLD);
 
+    if (shell->rm_confirm_mode) {
+        wattron(win, A_BOLD);
+        waddstr(win, "[y/N]: ");
+        wattroff(win, A_BOLD);
+        waddstr(win, shell->current_input);
+        wclrtoeol(win);
+        if (focused) {
+            int cx = 3 + 7 + shell->input_pos;
+            wmove(win, input_row, cx);
+            leaveok(win, FALSE);
+            curs_set(2);
+        } else {
+            leaveok(win, TRUE);
+        }
+        wnoutrefresh(win);
+        return;
+    }
+
     waddstr(win, shell->current_input);
 
     if (focused) {
         char ghost[MAX_FILENAME];
         compute_ghost(shell->current_input, shell->input_pos, cwd,
-                      ghost, sizeof(ghost));
+                      files, shell, ghost, sizeof(ghost));
         if (ghost[0] != '\0') {
             wclrtoeol(win);
             wattron(win, A_DIM);

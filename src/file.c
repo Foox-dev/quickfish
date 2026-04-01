@@ -18,7 +18,7 @@
 #define COL_W (INDEX_W + NAME_W)
 #define COL_PAD 2
 
-static int dir_is_empty(const char *path) {
+int dir_is_empty(const char *path) {
     int found = 0;
     struct dirent *de;
     DIR *d = opendir(path);
@@ -97,6 +97,7 @@ void files_load_directory(FilesBuffer *files, const char *path) {
         strncpy(e->name, de->d_name, MAX_FILENAME - 1);
         e->name[MAX_FILENAME - 1] = '\0';
         e->type = S_ISDIR(st.st_mode) ? ENTRY_DIR : ENTRY_FILE;
+        e->mode = st.st_mode;
         e->is_empty = (e->type == ENTRY_DIR) ? dir_is_empty(full) : 0;
         e->index = files->entry_count + 1;
         files->entry_count++;
@@ -105,16 +106,16 @@ void files_load_directory(FilesBuffer *files, const char *path) {
     files_sort_entries(files);
 }
 
-void files_sort_entries(FilesBuffer *files) {
-    for (int i = 0; i < files->entry_count - 1; i++) {
-        for (int j = i + 1; j < files->entry_count; j++) {
-            DirEntry *a = &files->entries[i];
-            DirEntry *b = &files->entries[j];
-            int swap = (a->type != b->type) ? (a->type == ENTRY_FILE) : (strcasecmp(a->name, b->name) > 0);
-            if (swap) { DirEntry t = *a; *a = *b; *b = t; }
-        }
-    }
+static int entry_cmp(const void *a, const void *b) {
+    const DirEntry *ea = (const DirEntry *)a;
+    const DirEntry *eb = (const DirEntry *)b;
+    if (ea->type != eb->type)
+        return (ea->type == ENTRY_DIR) ? -1 : 1;
+    return strcasecmp(ea->name, eb->name);
+}
 
+void files_sort_entries(FilesBuffer *files) {
+    qsort(files->entries, (size_t)files->entry_count, sizeof(DirEntry), entry_cmp);
     for (int i = 0; i < files->entry_count; i++)
         files->entries[i].index = i + 1;
 }
@@ -139,13 +140,19 @@ void files_select_prev_n(FilesBuffer *files, int n) {
 
 void files_change_dir(FilesBuffer *files, const char *dirname) {
     char new_path[PATH_MAX];
+    char return_to[MAX_FILENAME] = {0};
 
     if (strcmp(dirname, "..") == 0) {
         strncpy(new_path, files->cwd, PATH_MAX - 1);
+        new_path[PATH_MAX - 1] = '\0';
         char *slash = strrchr(new_path, '/');
         if (slash && slash != new_path) {
+            strncpy(return_to, slash + 1, MAX_FILENAME - 1);
             *slash = '\0';
-        } else strcpy(new_path, "/");
+        } else {
+            strncpy(return_to, new_path + 1, MAX_FILENAME - 1);
+            strcpy(new_path, "/");
+        }
     } else if (strcmp(files->cwd, "/") == 0) {
         snprintf(new_path, PATH_MAX, "/%.*s", (int)(PATH_MAX - 2), dirname);
     } else {
@@ -153,6 +160,15 @@ void files_change_dir(FilesBuffer *files, const char *dirname) {
     }
 
     files_load_directory(files, new_path);
+
+    if (return_to[0] != '\0') {
+        for (int i = 0; i < files->entry_count; i++) {
+            if (strcmp(files->entries[i].name, return_to) == 0) {
+                files->selected = i;
+                break;
+            }
+        }
+    }
 }
 
 int files_get_selected_path(FilesBuffer *files, char *out_path, size_t out_size) {
@@ -191,6 +207,137 @@ void refresh_files_buffer(FilesBuffer *files) {
     files->col_offset = saved_offset;
 }
 
+static int ext_color_normal(const char *name) {
+    const char *base = strrchr(name, '/');
+    base = base ? base + 1 : name;
+
+    // Im not even gonna lie, I do not know how tf this even works
+    // Good luck past me
+    if (!strcasecmp(base,"Makefile")||!strcasecmp(base,"makefile")||
+        !strcasecmp(base,"GNUmakefile")||!strcasecmp(base,"Rakefile")||
+        !strcasecmp(base,"Justfile")||!strcasecmp(base,"justfile")||
+        !strcasecmp(base,"Dockerfile")||!strcasecmp(base,"dockerfile")||
+        !strcasecmp(base,"Containerfile")||
+        !strcasecmp(base,"CMakeLists.txt")||
+        !strcasecmp(base,"meson.build")||!strcasecmp(base,"BUILD")||
+        !strcasecmp(base,"BUILD.bazel")||!strcasecmp(base,"WORKSPACE")||
+        !strcasecmp(base,"Vagrantfile")||!strcasecmp(base,"Guardfile")||
+        !strcasecmp(base,"Gemfile")||!strcasecmp(base,"Podfile"))
+        return CP_EXT_CODE;
+
+    if (!strcasecmp(base,"README")||!strcasecmp(base,"CHANGELOG")||
+        !strcasecmp(base,"CHANGES")||!strcasecmp(base,"AUTHORS")||
+        !strcasecmp(base,"CONTRIBUTORS")||!strcasecmp(base,"COPYING")||
+        !strcasecmp(base,"LICENSE")||!strcasecmp(base,"LICENCE")||
+        !strcasecmp(base,"NOTICE")||!strcasecmp(base,"PATENTS")||
+        !strcasecmp(base,"TODO")||!strcasecmp(base,"HACKING"))
+        return CP_EXT_DOC;
+
+    if (!strcasecmp(base,".gitignore")||!strcasecmp(base,".gitattributes")||
+        !strcasecmp(base,".gitmodules")||!strcasecmp(base,".editorconfig")||
+        !strcasecmp(base,".env")||!strcasecmp(base,".envrc")||
+        !strcasecmp(base,".npmrc")||!strcasecmp(base,".yarnrc")||
+        !strcasecmp(base,".babelrc")||!strcasecmp(base,".eslintrc")||
+        !strcasecmp(base,".prettierrc")||!strcasecmp(base,".stylelintrc")||
+        !strcasecmp(base,".dockerignore")||!strcasecmp(base,".htaccess")||
+        !strcasecmp(base,"Pipfile")||!strcasecmp(base,"Procfile")||
+        !strcasecmp(base,"requirements.txt")||!strcasecmp(base,"go.sum")||
+        !strcasecmp(base,"go.mod")||!strcasecmp(base,"Cargo.lock")||
+        !strcasecmp(base,"package-lock.json")||!strcasecmp(base,"yarn.lock")||
+        !strcasecmp(base,"composer.lock")||!strcasecmp(base,"Gemfile.lock"))
+        return CP_EXT_DATA;
+
+    const char *dot = strrchr(base, '.');
+    if (!dot || dot == base) return CP_FILE;
+    const char *ext = dot + 1;
+
+    if (!strcasecmp(ext,"png")||!strcasecmp(ext,"jpg")||!strcasecmp(ext,"jpeg")||
+        !strcasecmp(ext,"gif")||!strcasecmp(ext,"bmp")||!strcasecmp(ext,"tiff")||
+        !strcasecmp(ext,"tif")||!strcasecmp(ext,"webp")||!strcasecmp(ext,"svg")||
+        !strcasecmp(ext,"ico")||!strcasecmp(ext,"heic")||!strcasecmp(ext,"avif"))
+        return CP_EXT_IMAGE;
+
+    if (!strcasecmp(ext,"mp4")||!strcasecmp(ext,"mkv")||!strcasecmp(ext,"avi")||
+        !strcasecmp(ext,"mov")||!strcasecmp(ext,"wmv")||!strcasecmp(ext,"flv")||
+        !strcasecmp(ext,"webm")||!strcasecmp(ext,"m4v")||!strcasecmp(ext,"ts")||
+        !strcasecmp(ext,"mpg")||!strcasecmp(ext,"mpeg"))
+        return CP_EXT_VIDEO;
+
+    if (!strcasecmp(ext,"mp3")||!strcasecmp(ext,"flac")||!strcasecmp(ext,"ogg")||
+        !strcasecmp(ext,"wav")||!strcasecmp(ext,"aac")||!strcasecmp(ext,"m4a")||
+        !strcasecmp(ext,"opus")||!strcasecmp(ext,"wma")||!strcasecmp(ext,"aiff"))
+        return CP_EXT_AUDIO;
+
+    if (!strcasecmp(ext,"zip")||!strcasecmp(ext,"tar")||!strcasecmp(ext,"gz")||
+        !strcasecmp(ext,"bz2")||!strcasecmp(ext,"xz")||!strcasecmp(ext,"zst")||
+        !strcasecmp(ext,"7z")||!strcasecmp(ext,"rar")||!strcasecmp(ext,"deb")||
+        !strcasecmp(ext,"rpm")||!strcasecmp(ext,"pkg")||!strcasecmp(ext,"dmg")||
+        !strcasecmp(ext,"iso")||!strcasecmp(ext,"tgz")||!strcasecmp(ext,"tbz2"))
+        return CP_EXT_ARCHIVE;
+
+    if (!strcasecmp(ext,"c")||!strcasecmp(ext,"h")||!strcasecmp(ext,"cc")||
+        !strcasecmp(ext,"cpp")||!strcasecmp(ext,"cxx")||!strcasecmp(ext,"hh")||
+        !strcasecmp(ext,"hpp")||!strcasecmp(ext,"rs")||!strcasecmp(ext,"go")||
+        !strcasecmp(ext,"py")||!strcasecmp(ext,"rb")||!strcasecmp(ext,"java")||
+        !strcasecmp(ext,"js")||!strcasecmp(ext,"ts")||!strcasecmp(ext,"jsx")||
+        !strcasecmp(ext,"tsx")||!strcasecmp(ext,"lua")||!strcasecmp(ext,"zig")||
+        !strcasecmp(ext,"swift")||!strcasecmp(ext,"kt")||!strcasecmp(ext,"cs")||
+        !strcasecmp(ext,"php")||!strcasecmp(ext,"pl")||!strcasecmp(ext,"hs")||
+        !strcasecmp(ext,"el")||!strcasecmp(ext,"vim")||!strcasecmp(ext,"S")||
+        !strcasecmp(ext,"asm")||!strcasecmp(ext,"ex")||!strcasecmp(ext,"exs")||
+        !strcasecmp(ext,"clj")||!strcasecmp(ext,"scala")||!strcasecmp(ext,"ml"))
+        return CP_EXT_CODE;
+
+    if (!strcasecmp(ext,"sh")||!strcasecmp(ext,"bash")||!strcasecmp(ext,"zsh")||
+        !strcasecmp(ext,"fish")||!strcasecmp(ext,"ksh")||!strcasecmp(ext,"ps1")||
+        !strcasecmp(ext,"bat")||!strcasecmp(ext,"cmd")||!strcasecmp(ext,"out")||
+        !strcasecmp(ext,"run")||!strcasecmp(ext,"AppImage"))
+        return CP_EXT_EXEC;
+
+    if (!strcasecmp(ext,"pdf")||!strcasecmp(ext,"doc")||!strcasecmp(ext,"docx")||
+        !strcasecmp(ext,"odt")||!strcasecmp(ext,"rtf")||!strcasecmp(ext,"tex")||
+        !strcasecmp(ext,"md")||!strcasecmp(ext,"txt")||!strcasecmp(ext,"rst")||
+        !strcasecmp(ext,"org")||!strcasecmp(ext,"epub")||!strcasecmp(ext,"mobi")||
+        !strcasecmp(ext,"xls")||!strcasecmp(ext,"xlsx")||!strcasecmp(ext,"ods")||
+        !strcasecmp(ext,"ppt")||!strcasecmp(ext,"pptx")||!strcasecmp(ext,"odp"))
+        return CP_EXT_DOC;
+
+    if (!strcasecmp(ext,"json")||!strcasecmp(ext,"yaml")||!strcasecmp(ext,"yml")||
+        !strcasecmp(ext,"toml")||!strcasecmp(ext,"ini")||!strcasecmp(ext,"cfg")||
+        !strcasecmp(ext,"conf")||!strcasecmp(ext,"xml")||!strcasecmp(ext,"csv")||
+        !strcasecmp(ext,"tsv")||!strcasecmp(ext,"sql")||!strcasecmp(ext,"db")||
+        !strcasecmp(ext,"sqlite")||!strcasecmp(ext,"env")||!strcasecmp(ext,"lock")||
+        !strcasecmp(ext,"log")||!strcasecmp(ext,"pid"))
+        return CP_EXT_DATA;
+
+    return CP_FILE;
+}
+
+static int to_selected_pair(int normal_pair) {
+    switch (normal_pair) {
+        case CP_EXT_IMAGE: return CP_SEL_IMAGE;
+        case CP_EXT_VIDEO: return CP_SEL_VIDEO;
+        case CP_EXT_AUDIO: return CP_SEL_AUDIO;
+        case CP_EXT_ARCHIVE: return CP_SEL_ARCHIVE;
+        case CP_EXT_CODE: return CP_SEL_CODE;
+        case CP_EXT_DOC: return CP_SEL_DOC;
+        case CP_EXT_EXEC: return CP_SEL_EXEC;
+        case CP_EXT_DATA: return CP_SEL_DATA;
+        default: return CP_SEL_FILE;
+    }
+}
+
+int entry_color_pair(const DirEntry *e, int selected) {
+    if (e->type == ENTRY_DIR)
+        return selected ? CP_SEL_DIR : (e->is_empty ? CP_DIR_EMPTY : CP_DIR_FULL);
+
+    if (e->mode & (S_IXUSR | S_IXGRP | S_IXOTH))
+        return selected ? CP_SEL_EXEC : CP_EXT_EXEC;
+
+    int normal = ext_color_normal(e->name);
+    return selected ? to_selected_pair(normal) : normal;
+}
+
 void files_render(FilesBuffer *files, WINDOW *win, int height, int width, int focused) {
     int rows = height - 1;
     if (rows <= 0 || width <= 0) return;
@@ -219,7 +366,13 @@ void files_render(FilesBuffer *files, WINDOW *win, int height, int width, int fo
         }
 
         char count_str[32];
-        snprintf(count_str, sizeof(count_str), " %d i ", files->entry_count);
+        int cell_w = COL_W + COL_PAD;
+        int n_cols = (width / cell_w > 0) ? width / cell_w : 1;
+        int first = files->col_offset * rows;
+        int last = (files->col_offset + n_cols) * rows;
+        if (last > files->entry_count) last = files->entry_count;
+        int visible = (files->entry_count > 0) ? (last - first) : 0;
+        snprintf(count_str, sizeof(count_str), " %d/%d i ", visible, files->entry_count);
         int cx = width - (int)strlen(count_str);
         if (cx > 0)
             mvwprintw(win, 0, cx, "%s", count_str);
@@ -304,44 +457,51 @@ void files_render(FilesBuffer *files, WINDOW *win, int height, int width, int fo
 
             wmove(win, y, x+1);
 
-            if (sel)
-                wattron(win, COLOR_PAIR(CP_SELECTED) | A_BOLD);
+            int name_pair = entry_color_pair(e, 0);
+            int sel_pair = entry_color_pair(e, 1);
 
-            if (!sel) wattron(win, COLOR_PAIR(CP_INDEX));
+            if (sel)
+                wattron(win, COLOR_PAIR(sel_pair) | A_BOLD);
+            else
+                wattron(win, COLOR_PAIR(CP_INDEX));
             wprintw(win, "%3d ", e->index);
-            if (!sel) wattroff(win, COLOR_PAIR(CP_INDEX));
+            if (sel)
+                wattroff(win, COLOR_PAIR(sel_pair) | A_BOLD);
+            else
+                wattroff(win, COLOR_PAIR(CP_INDEX));
 
-            if (!sel) {
-                if (e->type == ENTRY_DIR) {
-                    if (e->is_empty)
-                        wattron(win, COLOR_PAIR(CP_DIR_EMPTY) | A_DIM);
-                    else
-                        wattron(win, COLOR_PAIR(CP_DIR_FULL) | A_BOLD);
-                } else {
-                    wattron(win, COLOR_PAIR(CP_FILE));
-                }
-            }
-
-            wprintw(win, "%-*.*s", NAME_W, NAME_W, e->name);
-
-            if (!sel) {
-                if (e->type == ENTRY_DIR) {
-                    if (e->is_empty)
-                        wattroff(win, COLOR_PAIR(CP_DIR_EMPTY) | A_DIM);
-                    else
-                        wattroff(win, COLOR_PAIR(CP_DIR_FULL) | A_BOLD);
-                } else {
-                    wattroff(win, COLOR_PAIR(CP_FILE));
-                }
-            }
+            attr_t name_attrs = A_NORMAL;
+            if (e->type == ENTRY_DIR)
+                name_attrs = e->is_empty ? A_DIM : A_BOLD;
+            else if (name_pair == CP_EXT_EXEC)
+                name_attrs = A_BOLD;
 
             if (sel)
-                wattroff(win, COLOR_PAIR(CP_SELECTED) | A_BOLD);
+                wattron(win, COLOR_PAIR(sel_pair) | A_BOLD);
+            else
+                wattron(win, COLOR_PAIR(name_pair) | name_attrs);
+
+            char display[NAME_W + 1];
+            if ((int)strlen(e->name) > NAME_W) {
+                strncpy(display, e->name, NAME_W - 2);
+                display[NAME_W - 2] = '.';
+                display[NAME_W - 1] = '.';
+                display[NAME_W] = '\0';
+            } else {
+                strncpy(display, e->name, NAME_W);
+                display[NAME_W] = '\0';
+            }
+            wprintw(win, "%-*.*s", NAME_W, NAME_W, display);
+
+            if (sel)
+                wattroff(win, COLOR_PAIR(sel_pair) | A_BOLD);
+            else
+                wattroff(win, COLOR_PAIR(name_pair) | name_attrs);
         }
     }
 
     if (files->col_offset > 0)
-        mvwprintw(win, 1, 0, "< ");
+        mvwprintw(win, 1, 0, "<");
     if (files->col_offset + n_cols < total_cols)
         mvwprintw(win, 1, width - 1, ">");
 
@@ -356,7 +516,7 @@ void files_cmd_stat(FilesBuffer *files, struct ShellBuffer *shell, const char *a
 
     char full[PATH_MAX];
     DirEntry *e = NULL;
-    DirEntry  synthetic = {0};
+    DirEntry synthetic = {0};
 
     if (arg[0] == '~') {
         const char *home = getenv("HOME");
@@ -453,4 +613,3 @@ void files_cmd_stat(FilesBuffer *files, struct ShellBuffer *shell, const char *a
 
     print_to_shell(shell, out);
 }
-
