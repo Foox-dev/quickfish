@@ -1,9 +1,10 @@
 #pragma once
 
 #include <ncurses.h>
+#include <panel.h>
 #include <stdlib.h>
 #include <string.h>
-#include <panel.h>
+
 #include "file.h"
 #include "shell.h"
 
@@ -11,43 +12,39 @@
 #define RENAME_BUF_MAX 512
 
 typedef enum {
-    BUFFER_FILES,
-    BUFFER_SHELL,
-    BUFFER_PREVIEW,
-    BUFFER_INFO,
+	BUFFER_FILES,
+	BUFFER_SHELL,
+	BUFFER_PREVIEW,
+	BUFFER_INFO,
 } BufferType;
 
 typedef struct {
-    FilesBuffer files;
-    ShellBuffer shell;
-    BufferType active_buffer;
-    BufferType prev_buffer;
-    WINDOW *files_win;
-    WINDOW *shell_win;
-
-    WINDOW *info_win;
-    PANEL *info_panel;
-    int info_mode;
-
-    int max_x, max_y;
-    int files_height, shell_height, divider_y;
-    int running;
-    int goto_mode;
-    char goto_buf[GOTO_BUF_MAX];
-    int goto_len;
-    int rename_mode;
-    char rename_buf[RENAME_BUF_MAX];
-    int rename_len;
-    int rename_cursor;
-
-    int quickshell_mode;
-    char quickshell_buf[SHELL_MAX_INPUT];
-    int quickshell_len;
-    int quickshell_cursor;
-
-    int preview_mode;
-    int preview_scroll;
-    int preview_last_selected;
+	BufferType active_buffer;
+	BufferType prev_buffer;
+	int info_mode;
+	int max_x, max_y;
+	int files_height, shell_height, divider_y;
+	int running;
+	int goto_mode;
+	int goto_len;
+	int rename_mode;
+	int rename_len;
+	int rename_cursor;
+	int quickshell_mode;
+	int quickshell_len;
+	int quickshell_cursor;
+	int preview_mode;
+	int preview_scroll;
+	int preview_last_selected;
+	WINDOW *files_win;
+	WINDOW *shell_win;
+	WINDOW *info_win;
+	PANEL *info_panel;
+	char goto_buf[GOTO_BUF_MAX];
+	char rename_buf[RENAME_BUF_MAX];
+	char quickshell_buf[SHELL_MAX_INPUT];
+	FilesBuffer files;
+	ShellBuffer shell;
 } TUI;
 
 TUI *tui_init(const char *start_dir);

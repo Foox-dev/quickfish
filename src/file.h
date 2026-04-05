@@ -1,7 +1,7 @@
 #pragma once
 
-#include <ncurses.h>
 #include <limits.h>
+#include <ncurses.h>
 #include <sys/stat.h>
 
 #include "colors.h"
@@ -10,24 +10,24 @@
 #define MAX_FILES 1000
 
 typedef enum {
-    ENTRY_FILE,
-    ENTRY_DIR,
+	ENTRY_FILE,
+	ENTRY_DIR,
 } EntryType;
 
 typedef struct {
-    char name[MAX_FILENAME];
-    EntryType type;
-    mode_t mode;
-    int index;
-    int is_empty;
+	int index;
+	int is_empty;
+	EntryType type;
+	mode_t mode;
+	char name[MAX_FILENAME];
 } DirEntry;
 
 typedef struct {
-    DirEntry entries[MAX_FILES];
-    int entry_count;
-    int selected;
-    int col_offset;
-    char cwd[PATH_MAX];
+	int entry_count;
+	int selected;
+	int col_offset;
+	char cwd[PATH_MAX];
+	DirEntry entries[MAX_FILES];
 } FilesBuffer;
 
 struct ShellBuffer;
