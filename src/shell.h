@@ -11,6 +11,10 @@
 #define SHELL_RESULT_MAX 128
 #define DIR_JUMPLIST_MAX 64
 
+#define SHELL_MSG_NORMAL 1
+#define SHELL_MSG_WARN 2
+#define SHELL_MSG_ERROR 3
+
 typedef struct ShellBuffer {
 	int history_count;
 	int history_index;
@@ -39,4 +43,4 @@ void shell_render(ShellBuffer *shell, WINDOW *win, int height,
 void compute_ghost(const char *input, int input_pos, const char *cwd,
                    const FilesBuffer *files, const ShellBuffer *shell,
                    char *ghost_out, int ghost_max);
-int print_to_shell(ShellBuffer *shell, const char *given);
+int print_to_shell(ShellBuffer *shell, const char *text, int type);

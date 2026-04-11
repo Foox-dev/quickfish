@@ -19,8 +19,10 @@ typedef enum {
 } BufferType;
 
 typedef struct {
-	BufferType active_buffer;
-	BufferType prev_buffer;
+	char index_jump_buf[8];
+	char goto_buf[GOTO_BUF_MAX];
+	char rename_buf[RENAME_BUF_MAX];
+	char quickshell_buf[SHELL_MAX_INPUT];
 	int info_mode;
 	int max_x, max_y;
 	int files_height, shell_height, divider_y;
@@ -36,22 +38,26 @@ typedef struct {
 	int preview_mode;
 	int preview_scroll;
 	int preview_last_selected;
+	int preview_saved_col_offset;
+	int index_jump_len;
+	BufferType active_buffer;
+	BufferType prev_buffer;
 	WINDOW *files_win;
 	WINDOW *shell_win;
 	WINDOW *info_win;
 	PANEL *info_panel;
-	char goto_buf[GOTO_BUF_MAX];
-	char rename_buf[RENAME_BUF_MAX];
-	char quickshell_buf[SHELL_MAX_INPUT];
 	FilesBuffer files;
 	ShellBuffer shell;
 } TUI;
 
 TUI *tui_init(const char *start_dir);
 void tui_cleanup(TUI *tui);
+void tui_run(TUI *tui);
 void tui_resize_handler(TUI *tui);
 void tui_render(TUI *tui);
 void tui_handle_input(TUI *tui, int ch);
 void tui_handle_files_input(TUI *tui, int ch);
 void tui_handle_preview_input(TUI *tui, int ch);
 void tui_handle_shell_input(TUI *tui, int ch);
+
+extern volatile int needs_resize;

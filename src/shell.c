@@ -299,14 +299,25 @@ static const char *parse_cd(const char *cmd) {
 	return after;
 }
 
-int print_to_shell(ShellBuffer *shell, const char *given) {
-	strncpy(shell->last_output, given, SHELL_OUTPUT_MAX - 1);
+int print_to_shell(ShellBuffer *shell, const char *text, int type) {
+	char formatted[SHELL_OUTPUT_MAX];
+
+	if (type == SHELL_MSG_ERROR) {
+		snprintf(formatted, sizeof(formatted), "ERROR: %s", text);
+	} else if (type == SHELL_MSG_WARN) {
+		snprintf(formatted, sizeof(formatted), "WARN: %s", text);
+	} else {
+		strncpy(formatted, text, sizeof(formatted) - 1);
+		formatted[sizeof(formatted) - 1] = '\0';
+	}
+
+	shell->last_output[0] = (char)type;
+	strncpy(shell->last_output + 1, formatted, SHELL_OUTPUT_MAX - 2);
 	shell->last_output[SHELL_OUTPUT_MAX - 1] = '\0';
 	return 0;
 }
 
-int execute_given(ShellBuffer *shell, FilesBuffer *files,
-                  WINDOW *files_win, WINDOW *shell_win) {
+int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WINDOW *shell_win) {
 	char cmd[SHELL_MAX_INPUT];
 	int len;
 	const char *label;
@@ -500,7 +511,7 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files,
 
 			if (any) {
 				snprintf(display + dlen, sizeof(display) - dlen, "Continue? [y/N]");
-				print_to_shell(shell, display);
+				print_to_shell(shell, display, 1);
 				shell->rm_confirm_mode = 1;
 				strncpy(shell->rm_pending_cmd, cmd, SHELL_MAX_INPUT - 1);
 				shell->rm_pending_cmd[SHELL_MAX_INPUT - 1] = '\0';
@@ -722,8 +733,30 @@ void shell_render(ShellBuffer *shell, WINDOW *win, int height, int focused,
 		start = (nlines > out_rows) ? nlines - out_rows : 0;
 		for (int i = start; i < nlines; i++) {
 			int row = 1 + (i - start);
+			const char *text = line_ptrs[i];
+			int pair = 0;
+			int bold = 0;
+
 			if (row >= height - 2) { break; }
-			mvwprintw(win, row, 1, "%.*s", width - 2, line_ptrs[i]);
+
+			wstandend(win);
+
+			if (text[0] == SHELL_MSG_ERROR) {
+				pair = CP_EXT_VIDEO;
+				bold = 1;
+				text++;
+			} else if (text[0] == SHELL_MSG_WARN) {
+				pair = CP_EXT_ARCHIVE;
+				bold = 1;
+				text++;
+			} else if (text[0] == SHELL_MSG_NORMAL) {
+				text++;
+			}
+
+			if (pair) { wattron(win, COLOR_PAIR(pair) | (bold ? A_BOLD : A_NORMAL)); }
+			mvwprintw(win, row, 1, "%.*s", width - 2, text);
+			if (pair) { wattroff(win, COLOR_PAIR(pair) | (bold ? A_BOLD : A_NORMAL)); }
+			wstandend(win);
 		}
 	}
 

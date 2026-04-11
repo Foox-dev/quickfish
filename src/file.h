@@ -48,3 +48,5 @@ int complete_in_dir(const char *dir, const char *prefix, char *out, int out_size
 int entry_color_pair(const DirEntry *e, int selected);
 void files_cmd_stat(FilesBuffer *files, struct ShellBuffer *shell, const char *arg);
 void refresh_files_buffer(FilesBuffer *files);
+
+void files_open_selected(FilesBuffer *files, struct ShellBuffer *shell, WINDOW *files_win, WINDOW *shell_win);

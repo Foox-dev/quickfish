@@ -15,15 +15,16 @@
 
 static void handle_resize(int sig);
 static void info_draw(TUI *tui);
+static void info_toggle(TUI *tui);
 static int preview_entry_cmp(const void *a, const void *b);
 static void edit_handle_ch(char *buf, int *len, int *cursor, int max, int ch);
 static void rebuild_windows(TUI *tui);
+static void preview_render_dir(TUI *tui, const char *path, int col, int avail, int max_rows);
+static void preview_render_file(TUI *tui, const char *path, DirEntry *e, int col, int avail, int max_rows);
 static void preview_render(TUI *tui, int list_w);
 static void render_goto_overlay(TUI *tui);
 static void render_rename_overlay(TUI *tui);
 static void render_quickshell_overlay(TUI *tui, int files_render_w);
-static void info_close(TUI *tui);
-static void info_open(TUI *tui);
 static void goto_begin(TUI *tui);
 static void goto_cancel(TUI *tui);
 static void goto_confirm(TUI *tui);
@@ -38,7 +39,7 @@ static void quickshell_cancel(TUI *tui);
 static void quickshell_execute(TUI *tui);
 static void handle_quickshell_input(TUI *tui, int ch);
 
-static volatile int needs_resize = 0;
+volatile int needs_resize = 0;
 
 static void handle_resize(int sig) { (void)sig; needs_resize = 1; }
 
@@ -104,11 +105,9 @@ static void rebuild_windows(TUI *tui) {
 	if (tui->shell_win) { keypad(tui->shell_win, TRUE); }
 
 	if (tui->info_win) {
-		if (tui->info_mode) {
-			info_draw(tui);
-		} else {
-			hide_panel(tui->info_panel);
-		}
+		wresize(tui->info_win, tui->max_y, tui->max_x);
+		replace_panel(tui->info_panel, tui->info_win);
+		if (!tui->info_mode) { hide_panel(tui->info_panel); }
 	}
 }
 
@@ -123,9 +122,9 @@ TUI *tui_init(const char *start_dir) {
 
 	initscr();
 	cbreak();
+	timeout(50);
 	noecho();
 	keypad(stdscr, TRUE);
-	nodelay(stdscr, TRUE);
 	curs_set(0);
 	set_escdelay(0);
 
@@ -189,6 +188,7 @@ TUI *tui_init(const char *start_dir) {
 	tui->shell.history_index = -1;
 
 	signal(SIGWINCH, handle_resize);
+
 	return tui;
 }
 
@@ -205,47 +205,194 @@ void tui_cleanup(TUI *tui) {
 void tui_resize_handler(TUI *tui) {
 	if (!needs_resize) { return; }
 	needs_resize = 0;
+
 	endwin();
 	refresh();
+	clear();
 	rebuild_windows(tui);
+
 	clearok(stdscr, TRUE);
 	if (tui->files_win) { clearok(tui->files_win, TRUE); touchwin(tui->files_win); }
 	if (tui->shell_win) { clearok(tui->shell_win, TRUE); touchwin(tui->shell_win); }
-	if (tui->info_win) {
-		clearok(tui->info_win, TRUE);
-		touchwin(tui->info_win);
+	if (tui->info_win)  { clearok(tui->info_win,  TRUE); touchwin(tui->info_win);  }
+
+	wrefresh(stdscr);
+}
+
+static void preview_render_dir(TUI *tui, const char *path, int col, int avail, int max_rows) {
+	DIR *d;
+	PreviewEntry *names;
+	struct dirent *de;
+	struct stat st;
+	DirEntry tmp_e;
+	char entry_path[PATH_MAX];
+	int total;
+	int max_scroll;
+	int rendered;
+	int cp;
+	attr_t at;
+
+	d = opendir(path);
+	if (!d) {
+		wattron(tui->files_win, A_DIM);
+		mvwprintw(tui->files_win, 1, col, "(cannot open dir)");
+		wattroff(tui->files_win, A_DIM);
+		return;
 	}
+
+	names = malloc(4096 * sizeof(PreviewEntry));
+	if (!names) { closedir(d); return; }
+	total = 0;
+
+	while ((de = readdir(d)) && total < 4096) {
+		if (de->d_name[0] == '.') { continue; }
+		strncpy(names[total].name, de->d_name, MAX_FILENAME - 1);
+		names[total].name[MAX_FILENAME - 1] = '\0';
+		path_join(entry_path, PATH_MAX, path, de->d_name);
+		if (stat(entry_path, &st) == 0) {
+			names[total].is_dir = S_ISDIR(st.st_mode);
+			names[total].is_empty = names[total].is_dir ? dir_is_empty(entry_path) : 0;
+			names[total].mode = st.st_mode;
+		} else {
+			names[total].is_dir = 0;
+			names[total].is_empty = 0;
+			names[total].mode = 0;
+		}
+		total++;
+	}
+	closedir(d);
+
+	qsort(names, (size_t)total, sizeof(PreviewEntry), preview_entry_cmp);
+
+	max_scroll = total - max_rows;
+	if (max_scroll < 0) { max_scroll = 0; }
+	if (tui->preview_scroll > max_scroll) { tui->preview_scroll = max_scroll; }
+
+	rendered = 0;
+	for (int i = tui->preview_scroll; i < total && rendered < max_rows; i++, rendered++) {
+		if (names[i].is_dir) {
+			if (names[i].is_empty) {
+				wattron(tui->files_win, COLOR_PAIR(CP_DIR_EMPTY) | A_DIM);
+				mvwprintw(tui->files_win, 1 + rendered, col, "%-*.*s", avail, avail, names[i].name);
+				wattroff(tui->files_win, COLOR_PAIR(CP_DIR_EMPTY) | A_DIM);
+			} else {
+				wattron(tui->files_win, COLOR_PAIR(CP_DIR_FULL) | A_BOLD);
+				mvwprintw(tui->files_win, 1 + rendered, col, "%-*.*s", avail, avail, names[i].name);
+				wattroff(tui->files_win, COLOR_PAIR(CP_DIR_FULL) | A_BOLD);
+			}
+		} else {
+			strncpy(tmp_e.name, names[i].name, MAX_FILENAME - 1);
+			tmp_e.name[MAX_FILENAME - 1] = '\0';
+			tmp_e.type = ENTRY_FILE;
+			tmp_e.is_empty = 0;
+			tmp_e.mode = names[i].mode;
+			cp = entry_color_pair(&tmp_e, 0);
+			at = (cp == CP_EXT_EXEC) ? A_BOLD : A_NORMAL;
+			wattron(tui->files_win, COLOR_PAIR(cp) | at);
+			mvwprintw(tui->files_win, 1 + rendered, col, "%-*.*s", avail, avail, names[i].name);
+			wattroff(tui->files_win, COLOR_PAIR(cp) | at);
+		}
+	}
+
+	if (total == 0) {
+		wattron(tui->files_win, A_DIM);
+		mvwprintw(tui->files_win, 1, col, "(empty)");
+		wattroff(tui->files_win, A_DIM);
+	}
+
+	free(names);
+}
+
+static void preview_render_file(TUI *tui, const char *path, DirEntry *e, int col, int avail, int max_rows) {
+	FILE *f;
+	char peek[512];
+	char line[256];
+	size_t n;
+	int cp;
+	int binary;
+	int row;
+	int len;
+
+	cp = entry_color_pair(e, 0);
+
+	if (cp == CP_EXT_IMAGE) {
+		wattron(tui->files_win, A_DIM);
+		mvwprintw(tui->files_win, 1, col, "(image)");
+		wattroff(tui->files_win, A_DIM);
+		return;
+	}
+	if (cp == CP_EXT_VIDEO) {
+		wattron(tui->files_win, A_DIM);
+		mvwprintw(tui->files_win, 1, col, "(video)");
+		wattroff(tui->files_win, A_DIM);
+		return;
+	}
+	if (cp == CP_EXT_AUDIO) {
+		wattron(tui->files_win, A_DIM);
+		mvwprintw(tui->files_win, 1, col, "(audio)");
+		wattroff(tui->files_win, A_DIM);
+		return;
+	}
+	if (cp == CP_EXT_ARCHIVE) {
+		wattron(tui->files_win, A_DIM);
+		mvwprintw(tui->files_win, 1, col, "(archive)");
+		wattroff(tui->files_win, A_DIM);
+		return;
+	}
+
+	f = fopen(path, "r");
+	if (!f) {
+		wattron(tui->files_win, A_DIM);
+		mvwprintw(tui->files_win, 1, col, "(cannot read)");
+		wattroff(tui->files_win, A_DIM);
+		return;
+	}
+
+	n = fread(peek, 1, sizeof(peek), f);
+	rewind(f);
+	binary = 0;
+	for (size_t i = 0; i < n; i++) {
+		unsigned char c = (unsigned char)peek[i];
+		if (c == 0 || (c < 7 && c != '\n' && c != '\r' && c != '\t')) {
+			binary = 1;
+			break;
+		}
+	}
+
+	if (n == 0) {
+		wattron(tui->files_win, A_DIM);
+		mvwprintw(tui->files_win, 1, col, "(empty)");
+		wattroff(tui->files_win, A_DIM);
+	} else if (binary) {
+		wattron(tui->files_win, A_DIM);
+		mvwprintw(tui->files_win, 1, col, "(binary)");
+		wattroff(tui->files_win, A_DIM);
+	} else {
+		rewind(f);
+		row = 0;
+		while (row < max_rows && fgets(line, sizeof(line), f)) {
+			len = (int)strlen(line);
+			if (len > 0 && line[len - 1] == '\n') { line[--len] = '\0'; }
+			if (len > 0 && line[len - 1] == '\r') { line[--len] = '\0'; }
+			mvwprintw(tui->files_win, 1 + row, col, "%-*.*s", avail, avail, line);
+			row++;
+		}
+	}
+
+	fclose(f);
 }
 
 static void preview_render(TUI *tui, int list_w) {
 	int preview_w;
 	int height;
 	int focused;
-	DirEntry *e;
 	int pair;
-	char preview_title[MAX_FILENAME + 16];
-	char path[PATH_MAX];
 	int col;
 	int avail;
 	int max_rows;
-	DIR *d;
-	PreviewEntry *names;
-	int total;
-	struct dirent *de;
-	char entry_path[PATH_MAX];
-	struct stat st;
-	int max_scroll;
-	int rendered;
-	DirEntry tmp_e;
-	int cp;
-	attr_t at;
-	FILE *f;
-	char peek[512];
-	size_t n;
-	int binary;
-	char line[256];
-	int row;
-	int len;
+	DirEntry *e;
+	char preview_title[MAX_FILENAME + 16];
+	char path[PATH_MAX];
 
 	preview_w = tui->max_x - list_w - 1;
 	height = tui->files_height;
@@ -279,118 +426,9 @@ static void preview_render(TUI *tui, int list_w) {
 	if (avail <= 0 || max_rows <= 0) { return; }
 
 	if (e->type == ENTRY_DIR) {
-		d = opendir(path);
-		if (!d) {
-			wattron(tui->files_win, A_DIM);
-			mvwprintw(tui->files_win, 1, col, "(cannot open dir)");
-			wattroff(tui->files_win, A_DIM);
-		} else {
-			names = malloc(4096 * sizeof(PreviewEntry));
-			if (!names) {
-				closedir(d);
-				return;
-			}
-			total = 0;
-
-			while ((de = readdir(d)) && total < 4096) {
-				if (de->d_name[0] == '.') { continue; }
-
-				strncpy(names[total].name, de->d_name, MAX_FILENAME - 1);
-				names[total].name[MAX_FILENAME - 1] = '\0';
-
-				path_join(entry_path, PATH_MAX, path, de->d_name);
-				if (stat(entry_path, &st) == 0) {
-					names[total].is_dir = S_ISDIR(st.st_mode);
-					names[total].is_empty = names[total].is_dir ? dir_is_empty(entry_path) : 0;
-					names[total].mode = st.st_mode;
-				} else {
-					names[total].is_dir = 0;
-					names[total].is_empty = 0;
-					names[total].mode = 0;
-				}
-				total++;
-			}
-			closedir(d);
-
-			qsort(names, (size_t)total, sizeof(PreviewEntry), preview_entry_cmp);
-
-			max_scroll = total - max_rows;
-			if (max_scroll < 0) { max_scroll = 0; }
-			if (tui->preview_scroll > max_scroll) { tui->preview_scroll = max_scroll; }
-
-			rendered = 0;
-			for (int i = tui->preview_scroll; i < total && rendered < max_rows; i++, rendered++) {
-				if (names[i].is_dir) {
-					if (names[i].is_empty) {
-						wattron(tui->files_win, COLOR_PAIR(CP_DIR_EMPTY) | A_DIM);
-						mvwprintw(tui->files_win, 1 + rendered, col, "%-*.*s", avail, avail, names[i].name);
-						wattroff(tui->files_win, COLOR_PAIR(CP_DIR_EMPTY) | A_DIM);
-					} else {
-						wattron(tui->files_win, COLOR_PAIR(CP_DIR_FULL) | A_BOLD);
-						mvwprintw(tui->files_win, 1 + rendered, col, "%-*.*s", avail, avail, names[i].name);
-						wattroff(tui->files_win, COLOR_PAIR(CP_DIR_FULL) | A_BOLD);
-					}
-				} else {
-					strncpy(tmp_e.name, names[i].name, MAX_FILENAME - 1);
-					tmp_e.name[MAX_FILENAME - 1] = '\0';
-					tmp_e.type = ENTRY_FILE;
-					tmp_e.is_empty = 0;
-					tmp_e.mode = names[i].mode;
-					cp = entry_color_pair(&tmp_e, 0);
-					at = (cp == CP_EXT_EXEC) ? A_BOLD : A_NORMAL;
-					wattron(tui->files_win, COLOR_PAIR(cp) | at);
-					mvwprintw(tui->files_win, 1 + rendered, col, "%-*.*s", avail, avail, names[i].name);
-					wattroff(tui->files_win, COLOR_PAIR(cp) | at);
-				}
-			}
-
-			if (total == 0) {
-				wattron(tui->files_win, A_DIM);
-				mvwprintw(tui->files_win, 1, col, "(empty)");
-				wattroff(tui->files_win, A_DIM);
-			}
-
-			free(names);
-		}
+		preview_render_dir(tui, path, col, avail, max_rows);
 	} else {
-		f = fopen(path, "r");
-		if (!f) {
-			wattron(tui->files_win, A_DIM);
-			mvwprintw(tui->files_win, 1, col, "(cannot read)");
-			wattroff(tui->files_win, A_DIM);
-		} else {
-			n = fread(peek, 1, sizeof(peek), f);
-			rewind(f);
-			binary = 0;
-			for (size_t i = 0; i < n; i++) {
-				unsigned char c = (unsigned char)peek[i];
-				if (c == 0 || (c < 7 && c != '\n' && c != '\r' && c != '\t')) {
-					binary = 1;
-					break;
-				}
-			}
-
-			if (n == 0) {
-				wattron(tui->files_win, A_DIM);
-				mvwprintw(tui->files_win, 1, col, "(empty)");
-				wattroff(tui->files_win, A_DIM);
-			} else if (binary) {
-				wattron(tui->files_win, A_DIM);
-				mvwprintw(tui->files_win, 1, col, "(binary)");
-				wattroff(tui->files_win, A_DIM);
-			} else {
-				rewind(f);
-				row = 0;
-				while (row < max_rows && fgets(line, sizeof(line), f)) {
-					len = (int)strlen(line);
-					if (len > 0 && line[len - 1] == '\n') { line[--len] = '\0'; }
-					if (len > 0 && line[len - 1] == '\r') { line[--len] = '\0'; }
-					mvwprintw(tui->files_win, 1 + row, col, "%-*.*s", avail, avail, line);
-					row++;
-				}
-			}
-			fclose(f);
-		}
+		preview_render_file(tui, path, e, col, avail, max_rows);
 	}
 
 	wnoutrefresh(tui->files_win);
@@ -448,10 +486,11 @@ static void render_quickshell_overlay(TUI *tui, int files_render_w) {
 	int avail;
 	char ghost[MAX_FILENAME];
 	int gx;
-	int clear_w;
+	int max_input_w;
 
 	qrow = tui->files_height - 1;
-	avail = files_render_w - 2;
+	max_input_w = files_render_w / 2;
+	avail = max_input_w - 2;
 	wattron(tui->files_win, COLOR_PAIR(1));
 	mvwprintw(tui->files_win, qrow, 0, "%s", ":");
 	wattroff(tui->files_win, COLOR_PAIR(1));
@@ -463,13 +502,12 @@ static void render_quickshell_overlay(TUI *tui, int files_render_w) {
 	              tui->files.cwd, &tui->files, &tui->shell, ghost, sizeof(ghost));
 	if (ghost[0] != '\0') {
 		gx = 1 + tui->quickshell_cursor;
-		clear_w = files_render_w - gx;
-		wmove(tui->files_win, qrow, gx);
-		if (clear_w > 0) { wprintw(tui->files_win, "%-*.*s", clear_w, clear_w, ""); }
-		wmove(tui->files_win, qrow, gx);
-		wattron(tui->files_win, A_DIM);
-		waddnstr(tui->files_win, ghost, files_render_w - gx);
-		wattroff(tui->files_win, A_DIM);
+		if (gx < max_input_w) {
+			wmove(tui->files_win, qrow, gx);
+			wattron(tui->files_win, A_DIM);
+			waddnstr(tui->files_win, ghost, max_input_w - gx);
+			wattroff(tui->files_win, A_DIM);
+		}
 	}
 	wmove(tui->files_win, qrow, 1 + tui->quickshell_cursor);
 	leaveok(tui->files_win, FALSE);
@@ -480,6 +518,9 @@ static void render_quickshell_overlay(TUI *tui, int files_render_w) {
 void tui_render(TUI *tui) {
 	int files_render_w;
 	int preview_w;
+	int cwdlen;
+	int cwd_avail;
+	int jump_x;
 
 	if (!tui) { return; }
 
@@ -507,8 +548,20 @@ void tui_render(TUI *tui) {
 	             tui->files_height, files_render_w,
 	             tui->active_buffer == BUFFER_FILES);
 
-	if (tui->preview_mode && tui->files_win) { preview_render(tui, files_render_w); }
+	if (tui->index_jump_len > 0 && tui->files_win) {
+		cwd_avail = files_render_w - 9;
+		cwdlen = (int)strlen(tui->files.cwd);
+		if (cwdlen > cwd_avail) { cwdlen = cwd_avail; }
+		jump_x = 9 + cwdlen + 1;
+		if (jump_x < files_render_w) {
+			wattron(tui->files_win, COLOR_PAIR(CP_PROMPT) | A_BOLD);
+			mvwprintw(tui->files_win, 0, jump_x, "%s", tui->index_jump_buf);
+			wattroff(tui->files_win, COLOR_PAIR(CP_PROMPT) | A_BOLD);
+			wnoutrefresh(tui->files_win);
+		}
+	}
 
+	if (tui->preview_mode && tui->files_win) { preview_render(tui, files_render_w); }
 	if (tui->goto_mode && tui->files_win) { render_goto_overlay(tui); }
 
 	shell_render(&tui->shell, tui->shell_win,
@@ -519,30 +572,25 @@ void tui_render(TUI *tui) {
 	if (tui->rename_mode && tui->files_win && tui->files.entry_count > 0) {
 		render_rename_overlay(tui);
 	}
-
 	if (tui->quickshell_mode && tui->files_win) {
 		render_quickshell_overlay(tui, files_render_w);
 	}
 
-	if (tui->info_mode) { update_panels(); }
-	doupdate();
-}
+	if (tui->info_mode && tui->info_win) {
+		info_draw(tui);
+		show_panel(tui->info_panel);
+	}
 
-static void info_close(TUI *tui) {
-	tui->info_mode = 0;
-	tui->active_buffer = tui->prev_buffer;
-	if (tui->info_panel) { hide_panel(tui->info_panel); }
 	update_panels();
 	doupdate();
 }
 
+/* Draws the help screen content into info_win. Window must already exist. */
 static void info_draw(TUI *tui) {
 	int w;
 	int row;
 	int mid;
 
-	wresize(tui->info_win, tui->max_y, tui->max_x);
-	replace_panel(tui->info_panel, tui->info_win);
 	werase(tui->info_win);
 	box(tui->info_win, 0, 0);
 
@@ -604,12 +652,16 @@ static void info_draw(TUI *tui) {
 	mvwprintw(tui->info_win, tui->max_y - 2, 2, "%-*.*s", w, w, "Press any key to return.");
 	wattroff(tui->info_win, A_DIM);
 
-	show_panel(tui->info_panel);
-	update_panels();
-	doupdate();
+	wnoutrefresh(tui->info_win);
 }
 
-static void info_open(TUI *tui) {
+static void info_toggle(TUI *tui) {
+	if (tui->info_mode) {
+		tui->info_mode = 0;
+		tui->active_buffer = tui->prev_buffer;
+		hide_panel(tui->info_panel);
+		return;
+	}
 	tui->prev_buffer = tui->active_buffer;
 	tui->active_buffer = BUFFER_INFO;
 	tui->info_mode = 1;
@@ -617,7 +669,25 @@ static void info_open(TUI *tui) {
 		tui->info_win = newwin(tui->max_y, tui->max_x, 0, 0);
 		tui->info_panel = new_panel(tui->info_win);
 	}
-	info_draw(tui);
+}
+
+void tui_run(TUI *tui) {
+	int ch;
+	while (tui->running) {
+		if (needs_resize) {
+			tui_resize_handler(tui);
+			continue;
+		}
+		tui_render(tui);
+		ch = wgetch(stdscr);
+		if (ch == KEY_RESIZE) {
+			needs_resize = 1;
+			continue;
+    }
+    if (ch != ERR) {
+      tui_handle_input(tui, ch);
+    }
+  }
 }
 
 static void goto_begin(TUI *tui) {
@@ -649,6 +719,7 @@ static void goto_confirm(TUI *tui) {
 	const char *match;
 	char resolved[PATH_MAX];
 	const char *use;
+	DirEntry *e;
 
 	if (tui->goto_len == 0) { return; }
 
@@ -687,7 +758,7 @@ static void goto_confirm(TUI *tui) {
 		if (*endp == '\0' && idx > 0) {
 			for (int i = 0; i < tui->files.entry_count; i++) {
 				if (tui->files.entries[i].index != (int)idx) { continue; }
-				DirEntry *e = &tui->files.entries[i];
+				e = &tui->files.entries[i];
 				if (e->type == ENTRY_DIR) { files_change_dir(&tui->files, e->name); }
 				return;
 			}
@@ -722,7 +793,7 @@ static void goto_confirm(TUI *tui) {
 
 	for (int i = 0; i < tui->files.entry_count; i++) {
 		if (strcasecmp(tui->files.entries[i].name, match) != 0) { continue; }
-		DirEntry *e = &tui->files.entries[i];
+		e = &tui->files.entries[i];
 		if (e->type == ENTRY_DIR) { files_change_dir(&tui->files, e->name); }
 		return;
 	}
@@ -919,16 +990,32 @@ void tui_handle_preview_input(TUI *tui, int ch) {
 	case 'p':
 		tui->preview_mode = 0;
 		tui->active_buffer = BUFFER_FILES;
+		tui->files.col_offset = tui->preview_saved_col_offset;
 		break;
 	}
 }
 
 void tui_handle_files_input(TUI *tui, int ch) {
 	DirEntry *e;
+	int idx;
+	char *endp;
 
 	if (tui->rename_mode) { handle_rename_input(tui, ch); return; }
 	if (tui->goto_mode) { handle_goto_input(tui, ch); return; }
 	if (tui->quickshell_mode) { handle_quickshell_input(tui, ch); return; }
+
+	if (ch >= '0' && ch <= '9') {
+		if (tui->index_jump_len < (int)sizeof(tui->index_jump_buf) - 1) {
+			tui->index_jump_buf[tui->index_jump_len++] = (char)ch;
+			tui->index_jump_buf[tui->index_jump_len] = '\0';
+		}
+		return;
+	}
+
+	if (ch != 'g' && tui->index_jump_len > 0) {
+		tui->index_jump_len = 0;
+		tui->index_jump_buf[0] = '\0';
+	}
 
 	switch (ch) {
 	case 'j': case KEY_DOWN:
@@ -955,11 +1042,31 @@ void tui_handle_files_input(TUI *tui, int ch) {
 	case '\n': case '\r': case KEY_ENTER:
 		if (tui->files.entry_count == 0) { break; }
 		e = &tui->files.entries[tui->files.selected];
-		if (e->type == ENTRY_DIR) { files_change_dir(&tui->files, e->name); }
+		if (e->type == ENTRY_DIR) {
+			files_change_dir(&tui->files, e->name);
+		} else {
+			files_open_selected(&tui->files, &tui->shell, tui->files_win, tui->shell_win);
+		}
 		break;
 
 	case 'g':
-		goto_begin(tui);
+		if (tui->index_jump_len > 0) {
+			idx = (int)strtol(tui->index_jump_buf, &endp, 10);
+			if (idx > tui->files.entry_count) {
+				print_to_shell(&tui->shell, "Jump index is higher then the file buffer!\n", 3);
+			}
+			tui->index_jump_len = 0;
+			tui->index_jump_buf[0] = '\0';
+			if (*endp == '\0' && idx > 0) {
+				for (int i = 0; i < tui->files.entry_count; i++) {
+					if (tui->files.entries[i].index != idx) { continue; }
+					tui->files.selected = i;
+					break;
+				}
+			}
+		} else {
+			goto_begin(tui);
+		}
 		break;
 
 	case 'r':
@@ -972,8 +1079,13 @@ void tui_handle_files_input(TUI *tui, int ch) {
 
 	case 'p':
 		tui->preview_mode = !tui->preview_mode;
-		if (!tui->preview_mode && tui->active_buffer == BUFFER_PREVIEW) {
-			tui->active_buffer = BUFFER_FILES;
+		if (tui->preview_mode) {
+			tui->preview_saved_col_offset = tui->files.col_offset;
+		} else {
+			tui->files.col_offset = tui->preview_saved_col_offset;
+			if (tui->active_buffer == BUFFER_PREVIEW) {
+				tui->active_buffer = BUFFER_FILES;
+			}
 		}
 		break;
 	}
@@ -996,13 +1108,13 @@ void tui_handle_shell_input(TUI *tui, int ch) {
 				refresh_files_buffer(&tui->files);
 			} else {
 				tui->shell.rm_confirm_mode = 0;
-				print_to_shell(&tui->shell, "Aborted.");
+				print_to_shell(&tui->shell, "Aborted.", 1);
 			}
 		} else if (ch == 27) {
 			tui->shell.rm_confirm_mode = 0;
 			memset(tui->shell.current_input, 0, SHELL_MAX_INPUT);
 			tui->shell.input_pos = 0;
-			print_to_shell(&tui->shell, "Aborted.");
+			print_to_shell(&tui->shell, "Aborted.", 1);
 		} else {
 			shell_handle_char(&tui->shell, ch);
 		}
@@ -1024,7 +1136,7 @@ void tui_handle_shell_input(TUI *tui, int ch) {
 
 void tui_handle_input(TUI *tui, int ch) {
 	if (tui->active_buffer == BUFFER_INFO) {
-		info_close(tui);
+		info_toggle(tui);
 		return;
 	}
 
@@ -1045,7 +1157,7 @@ void tui_handle_input(TUI *tui, int ch) {
 			curs_set(0);
 			return;
 		}
-		if (ch == KEY_F(1)) { info_open(tui); return; }
+		if (ch == KEY_F(1)) { info_toggle(tui); return; }
 	}
 
 	if (tui->active_buffer == BUFFER_SHELL) {
