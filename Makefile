@@ -19,7 +19,7 @@ WIDTH = $(shell echo $$(($(TOTAL)<10?1:$(TOTAL)<100?2:3)))
 
 .PHONY: dev rel clean install uninstall format
 
-dev: $(DEV_BUILDDIR)/sourcefish
+dev: $(DEV_BUILDDIR)/quickfish
 
 $(DEV_BUILDDIR):
 	@mkdir -p $(DEV_BUILDDIR)
@@ -35,7 +35,7 @@ $(DEV_BUILDDIR)/%.o: src/%.c | $(DEV_BUILDDIR)
 	@printf "[%*d/%d] Compiling %s (dev)\n" $(WIDTH) $(COUNT) $(TOTAL) $<
 	@$(CC) $(CFLAGS_DEV) -c $< -o $@
 
-$(DEV_BUILDDIR)/sourcefish: $(OBJ_DEV) $(THEME_OBJ_DEV)
+$(DEV_BUILDDIR)/quickfish: $(OBJ_DEV) $(THEME_OBJ_DEV)
 	@$(eval COUNT=$(shell echo $$(($(COUNT)+1))))
 	@printf "[%*d/%d] Linking %s (dev)\n" $(WIDTH) $(COUNT) $(TOTAL) $@
 	@$(CC) $(OBJ_DEV) $(THEME_OBJ_DEV) $(LDFLAGS) $(LDLIBS) -o $@
@@ -43,7 +43,7 @@ $(DEV_BUILDDIR)/sourcefish: $(OBJ_DEV) $(THEME_OBJ_DEV)
 
 -include $(DEP_DEV)
 
-rel: $(REL_BUILDDIR)/sourcefish
+rel: $(REL_BUILDDIR)/quickfish
 
 $(REL_BUILDDIR):
 	@mkdir -p $(REL_BUILDDIR)
@@ -59,7 +59,7 @@ $(REL_BUILDDIR)/%.o: src/%.c | $(REL_BUILDDIR)
 	@printf "[%*d/%d] Compiling %s (release)\n" $(WIDTH) $(COUNT) $(TOTAL) $<
 	@$(CC) $(CFLAGS_REL) -c $< -o $@
 
-$(REL_BUILDDIR)/sourcefish: $(OBJ_REL) $(THEME_OBJ_REL)
+$(REL_BUILDDIR)/quickfish: $(OBJ_REL) $(THEME_OBJ_REL)
 	@$(eval COUNT=$(shell echo $$(($(COUNT)+1))))
 	@printf "[%*d/%d] Linking %s (release)\n" $(WIDTH) $(COUNT) $(TOTAL) $@
 	@$(CC) $(OBJ_REL) $(THEME_OBJ_REL) $(LDFLAGS) $(LDLIBS) -o $@
@@ -69,12 +69,12 @@ $(REL_BUILDDIR)/sourcefish: $(OBJ_REL) $(THEME_OBJ_REL)
 -include $(DEP_REL)
 
 install:
-	install -Dm755 $(REL_BUILDDIR)/sourcefish $(DESTDIR)$(BINDIR)/sourcefish
-	install -Dm644 LICENSE $(DESTDIR)/usr/share/licenses/sourcefish/LICENSE
-	install -Dm644 README.md $(DESTDIR)/usr/share/doc/sourcefish/README.md
+	install -Dm755 $(REL_BUILDDIR)/quickfish $(DESTDIR)$(BINDIR)/quickfish
+	install -Dm644 LICENSE $(DESTDIR)/usr/share/licenses/quickfish/LICENSE
+	install -Dm644 README.md $(DESTDIR)/usr/share/doc/quickfish/README.md
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/sourcefish
+	rm -f $(DESTDIR)$(BINDIR)/quickfish
 
 clean:
 	rm -rf $(DEV_BUILDDIR) $(REL_BUILDDIR)

@@ -604,7 +604,7 @@ static void info_draw(TUI *tui) {
 	row++;
 
 	wattron(tui->info_win, A_BOLD);
-	mvwprintw(tui->info_win, row++, 2, "Sourcefish - a tui filemanager designed to remove the need for GUI alternatives ");
+	mvwprintw(tui->info_win, row++, 2, "Quickfish - a tui filemanager designed to remove the need for GUI alternatives ");
 	wattroff(tui->info_win, A_BOLD);
 	mvwprintw(tui->info_win, row++, 2, "Released under GPL-2.0 license.");
 	row++;
@@ -644,7 +644,7 @@ static void info_draw(TUI *tui) {
 
 	row++;
 	wattron(tui->info_win, A_DIM);
-	mvwprintw(tui->info_win, row++, 2, "Note: this page (and sourcefish itself) is still in heavy development.");
+	mvwprintw(tui->info_win, row++, 2, "Note: this page (and quickfish itself) is still in heavy development.");
 	mvwprintw(tui->info_win, row++, 2, "Things are subject to change!");
 	wattroff(tui->info_win, A_DIM);
 

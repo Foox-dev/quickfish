@@ -1,4 +1,4 @@
-# Todo list for sourcefish
+# Todo list for quickfish
 Also has some feature ideas and stuff, yada yada.
 
 ## TODO
