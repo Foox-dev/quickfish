@@ -27,6 +27,11 @@ static int dir_size_walk(const char *path, const struct stat *st, int type, stru
 static off_t compute_dir_size(const char *path);
 static int ext_color_normal(const char *name);
 static int to_selected_pair(int normal_pair);
+static void push_undo(FilesBuffer *files, UndoOp op);
+static void do_trash_entry(FilesBuffer *files, struct ShellBuffer *shell, int idx);
+static void do_delete_entry(FilesBuffer *files, struct ShellBuffer *shell, int idx);
+static void files_move_reindex(FilesBuffer *files);
+static void files_move_print_register(FilesBuffer *files, struct ShellBuffer *shell);
 
 int dir_is_empty(const char *path) {
 	int found;
@@ -90,6 +95,15 @@ void files_load_directory(FilesBuffer *files, const char *path) {
 	char full[PATH_MAX];
 	struct stat st;
 	DirEntry *e;
+	int saved_undo_top;
+	int saved_redo_top;
+	UndoOp saved_undo[UNDO_MAX];
+	UndoOp saved_redo[UNDO_MAX];
+
+	saved_undo_top = files->undo_top;
+	saved_redo_top = files->redo_top;
+	memcpy(saved_undo, files->undo_stack, sizeof(saved_undo));
+	memcpy(saved_redo, files->redo_stack, sizeof(saved_redo));
 
 	use = realpath(path, resolved) ? resolved : path;
 
@@ -101,12 +115,20 @@ void files_load_directory(FilesBuffer *files, const char *path) {
 		files->entry_count = 0;
 		files->selected = 0;
 		files->col_offset = 0;
+		files->sel_count = 0;
+		memset(files->multi_sel, 0, sizeof(files->multi_sel));
+		memcpy(files->undo_stack, saved_undo, sizeof(saved_undo));
+		memcpy(files->redo_stack, saved_redo, sizeof(saved_redo));
+		files->undo_top = saved_undo_top;
+		files->redo_top = saved_redo_top;
 		return;
 	}
 
 	files->entry_count = 0;
 	files->selected = 0;
 	files->col_offset = 0;
+	files->sel_count = 0;
+	memset(files->multi_sel, 0, sizeof(files->multi_sel));
 
 	while ((de = readdir(dir)) && files->entry_count < MAX_FILES) {
 		if (de->d_name[0] == '.') { continue; }
@@ -126,6 +148,12 @@ void files_load_directory(FilesBuffer *files, const char *path) {
 	}
 	closedir(dir);
 	files_sort_entries(files);
+
+	memcpy(files->undo_stack, saved_undo, sizeof(saved_undo));
+	memcpy(files->redo_stack, saved_redo, sizeof(saved_redo));
+	files->undo_top = saved_undo_top;
+	files->redo_top = saved_redo_top;
+	files_move_reindex(files);
 }
 
 static int entry_cmp(const void *a, const void *b) {
@@ -393,6 +421,7 @@ void files_render(FilesBuffer *files, WINDOW *win, int height, int width, int fo
 	const char *cwd;
 	int avail;
 	char count_str[32];
+	char sel_str[32];
 	int cell_w;
 	int n_cols;
 	int first;
@@ -400,6 +429,7 @@ void files_render(FilesBuffer *files, WINDOW *win, int height, int width, int fo
 	int visible;
 	int cwdlen;
 	int cx;
+	int sx;
 	DirEntry *selected_entry;
 	char full[PATH_MAX];
 	struct stat st;
@@ -454,6 +484,23 @@ void files_render(FilesBuffer *files, WINDOW *win, int height, int width, int fo
 	visible = (files->entry_count > 0) ? (last - first) : 0;
 	snprintf(count_str, sizeof(count_str), " %d/%d i ", visible, files->entry_count);
 	cx = width - (int)strlen(count_str);
+	if (files->sel_count > 0 && cx > 0) {
+		snprintf(sel_str, sizeof(sel_str), " [%d sel] ", files->sel_count);
+		sx = cx - (int)strlen(sel_str);
+		if (sx > 0) {
+			wattron(win, COLOR_PAIR(CP_MULTI_SEL) | A_BOLD);
+			mvwprintw(win, 0, sx, "%s", sel_str);
+			wattroff(win, COLOR_PAIR(CP_MULTI_SEL) | A_BOLD);
+		} else {
+			/* Doesn't fit beside the item counter — render below it on row 1. */
+			int sel_len = (int)strlen(sel_str);
+			int sel_x   = width - sel_len;
+			if (sel_x < 0) { sel_x = 0; }
+			wattron(win, COLOR_PAIR(CP_MULTI_SEL) | A_BOLD);
+			mvwprintw(win, 1, sel_x, "%s", sel_str);
+			wattroff(win, COLOR_PAIR(CP_MULTI_SEL) | A_BOLD);
+		}
+	}
 	if (cx > 0) { mvwprintw(win, 0, cx, "%s", count_str); }
 
 	if (files->entry_count > 0) {
@@ -528,15 +575,21 @@ void files_render(FilesBuffer *files, WINDOW *win, int height, int width, int fo
 			name_pair = entry_color_pair(e, 0);
 			sel_pair = entry_color_pair(e, 1);
 
-			if (is_sel) {
+			if (files->in_move_reg[idx]) {
+				wattron(win, COLOR_PAIR(CP_EXT_ARCHIVE) | A_BOLD);
+				wprintw(win, "mv> ");
+				wattroff(win, COLOR_PAIR(CP_EXT_ARCHIVE) | A_BOLD);
+			} else if (is_sel) {
 				wattron(win, COLOR_PAIR(sel_pair) | A_BOLD);
+				wprintw(win, "%3d ", e->index);
+				wattroff(win, COLOR_PAIR(sel_pair) | A_BOLD);
+			} else if (files->multi_sel[idx]) {
+				wattron(win, COLOR_PAIR(CP_MULTI_SEL) | A_BOLD);
+				wprintw(win, "%3d ", e->index);
+				wattroff(win, COLOR_PAIR(CP_MULTI_SEL) | A_BOLD);
 			} else {
 				wattron(win, COLOR_PAIR(CP_INDEX));
-			}
-			wprintw(win, "%3d ", e->index);
-			if (is_sel) {
-				wattroff(win, COLOR_PAIR(sel_pair) | A_BOLD);
-			} else {
+				wprintw(win, "%3d ", e->index);
 				wattroff(win, COLOR_PAIR(CP_INDEX));
 			}
 
@@ -549,6 +602,8 @@ void files_render(FilesBuffer *files, WINDOW *win, int height, int width, int fo
 
 			if (is_sel) {
 				wattron(win, COLOR_PAIR(sel_pair) | A_BOLD);
+			} else if (files->multi_sel[idx]) {
+				wattron(win, COLOR_PAIR(CP_MULTI_SEL) | A_BOLD);
 			} else {
 				wattron(win, COLOR_PAIR(name_pair) | name_attrs);
 			}
@@ -566,6 +621,8 @@ void files_render(FilesBuffer *files, WINDOW *win, int height, int width, int fo
 
 			if (is_sel) {
 				wattroff(win, COLOR_PAIR(sel_pair) | A_BOLD);
+			} else if (files->multi_sel[idx]) {
+				wattroff(win, COLOR_PAIR(CP_MULTI_SEL) | A_BOLD);
 			} else {
 				wattroff(win, COLOR_PAIR(name_pair) | name_attrs);
 			}
@@ -693,6 +750,255 @@ void files_cmd_stat(FilesBuffer *files, struct ShellBuffer *shell, const char *a
 	);
 
 	print_to_shell(shell, out, 1);
+}
+
+static void push_undo(FilesBuffer *files, UndoOp op) {
+	if (files->undo_top < UNDO_MAX) {
+		files->undo_stack[files->undo_top++] = op;
+	} else {
+		memmove(&files->undo_stack[0], &files->undo_stack[1],
+		        (UNDO_MAX - 1) * sizeof(UndoOp));
+		files->undo_stack[UNDO_MAX - 1] = op;
+	}
+	files->redo_top = 0;
+}
+
+static void do_trash_entry(FilesBuffer *files, struct ShellBuffer *shell, int idx) {
+	char entry_path[PATH_MAX];
+	char trash_dir[PATH_MAX];
+	char trash_dest[PATH_MAX];
+	char mkdir_cmd[PATH_MAX + 16];
+	char mv_cmd[PATH_MAX * 2 + 8];
+	const char *home;
+	struct stat st;
+	UndoOp op;
+
+	if (idx < 0 || idx >= files->entry_count) { return; }
+
+	if (strcmp(files->cwd, "/") == 0) {
+		snprintf(entry_path, PATH_MAX, "/%s", files->entries[idx].name);
+	} else {
+		path_join(entry_path, PATH_MAX, files->cwd, files->entries[idx].name);
+	}
+
+	home = getenv("HOME");
+	if (!home || home[0] == '\0') { home = "/tmp"; }
+	snprintf(trash_dir, sizeof(trash_dir), "%s/.local/share/Trash/files", home);
+	snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p '%s'", trash_dir);
+	system(mkdir_cmd);
+
+	path_join(trash_dest, sizeof(trash_dest), trash_dir, files->entries[idx].name);
+	if (stat(trash_dest, &st) == 0) {
+		char ts_suffix[24];
+		snprintf(ts_suffix, sizeof(ts_suffix), ".%ld", (long)time(NULL));
+		strncat(trash_dest, ts_suffix, sizeof(trash_dest) - strlen(trash_dest) - 1);
+	}
+
+	snprintf(mv_cmd, sizeof(mv_cmd), "mv '%s' '%s'", entry_path, trash_dest);
+	system(mv_cmd);
+
+	op.type = OP_TRASH;
+	strncpy(op.cwd, files->cwd, PATH_MAX - 1);
+	op.cwd[PATH_MAX - 1] = '\0';
+	strncpy(op.old_name, files->entries[idx].name, MAX_FILENAME - 1);
+	op.old_name[MAX_FILENAME - 1] = '\0';
+	op.new_name[0] = '\0';
+	strncpy(op.trash_path, trash_dest, PATH_MAX - 1);
+	op.trash_path[PATH_MAX - 1] = '\0';
+
+	push_undo(files, op);
+	(void)shell;
+}
+
+static void do_delete_entry(FilesBuffer *files, struct ShellBuffer *shell, int idx) {
+	char entry_path[PATH_MAX];
+	char cmd[PATH_MAX + 16];
+	UndoOp op;
+
+	if (idx < 0 || idx >= files->entry_count) { return; }
+
+	if (strcmp(files->cwd, "/") == 0) {
+		snprintf(entry_path, PATH_MAX, "/%s", files->entries[idx].name);
+	} else {
+		path_join(entry_path, PATH_MAX, files->cwd, files->entries[idx].name);
+	}
+
+	op.type = OP_DELETE_PERM;
+	strncpy(op.cwd, files->cwd, PATH_MAX - 1);
+	op.cwd[PATH_MAX - 1] = '\0';
+	strncpy(op.old_name, files->entries[idx].name, MAX_FILENAME - 1);
+	op.old_name[MAX_FILENAME - 1] = '\0';
+	op.new_name[0] = '\0';
+	op.trash_path[0] = '\0';
+
+	if (files->entries[idx].type == ENTRY_DIR) {
+		snprintf(cmd, sizeof(cmd), "rm -rf '%s'", entry_path);
+	} else {
+		snprintf(cmd, sizeof(cmd), "rm -f '%s'", entry_path);
+	}
+	system(cmd);
+
+	push_undo(files, op);
+	(void)shell;
+}
+
+void files_toggle_select(FilesBuffer *files, int idx) {
+	if (idx < 0 || idx >= files->entry_count) { return; }
+	if (files->multi_sel[idx]) {
+		files->multi_sel[idx] = 0;
+		files->sel_count--;
+	} else {
+		files->multi_sel[idx] = 1;
+		files->sel_count++;
+	}
+}
+
+void files_clear_selection(FilesBuffer *files) {
+	memset(files->multi_sel, 0, sizeof(files->multi_sel));
+	files->sel_count = 0;
+}
+
+void files_delete_to_trash(FilesBuffer *files, struct ShellBuffer *shell) {
+	if (files->sel_count > 0) {
+		for (int i = 0; i < files->entry_count; i++) {
+			if (files->multi_sel[i]) {
+				do_trash_entry(files, shell, i);
+			}
+		}
+		files_clear_selection(files);
+	} else {
+		do_trash_entry(files, shell, files->selected);
+	}
+}
+
+void files_delete_permanent(FilesBuffer *files, struct ShellBuffer *shell) {
+	if (files->sel_count > 0) {
+		for (int i = 0; i < files->entry_count; i++) {
+			if (files->multi_sel[i]) {
+				do_delete_entry(files, shell, i);
+			}
+		}
+		files_clear_selection(files);
+	} else {
+		do_delete_entry(files, shell, files->selected);
+	}
+}
+
+int files_build_sel_args(FilesBuffer *files, char *out, int out_size) {
+	int written;
+	int n;
+
+	written = 0;
+	for (int i = 0; i < files->entry_count; i++) {
+		if (!files->multi_sel[i]) { continue; }
+		if (written > 0 && written < out_size - 1) {
+			out[written++] = ' ';
+		}
+		n = snprintf(out + written, out_size - written, "'%s'", files->entries[i].name);
+		if (n > 0) { written += n; }
+		if (written >= out_size - 1) { break; }
+	}
+	out[written] = '\0';
+	return written;
+}
+
+void files_undo(FilesBuffer *files, struct ShellBuffer *shell) {
+	UndoOp *op;
+	char old_path[PATH_MAX];
+	char new_path[PATH_MAX];
+	char restore_cmd[PATH_MAX * 2 + 16];
+	char msg[MAX_FILENAME * 2 + 64];
+
+	if (files->undo_top == 0) {
+		print_to_shell(shell, "Nothing to undo.\n", SHELL_MSG_WARN);
+		return;
+	}
+
+	op = &files->undo_stack[--files->undo_top];
+
+	if (files->redo_top < UNDO_MAX) {
+		files->redo_stack[files->redo_top++] = *op;
+	}
+
+	switch (op->type) {
+	case OP_RENAME:
+		if (strcmp(op->cwd, "/") == 0) {
+			snprintf(old_path, PATH_MAX, "/%s", op->new_name);
+			snprintf(new_path, PATH_MAX, "/%s", op->old_name);
+		} else {
+			path_join(old_path, PATH_MAX, op->cwd, op->new_name);
+			path_join(new_path, PATH_MAX, op->cwd, op->old_name);
+		}
+		if (rename(old_path, new_path) == 0) {
+			snprintf(msg, sizeof(msg), "Undo rename: '%.255s' -> '%.255s'\n", op->new_name, op->old_name);
+			print_to_shell(shell, msg, SHELL_MSG_NORMAL);
+		}
+		break;
+	case OP_TRASH:
+		if (op->trash_path[0] == '\0') {
+			print_to_shell(shell, "Undo trash: path unknown.\n", SHELL_MSG_WARN);
+			break;
+		}
+		if (strcmp(op->cwd, "/") == 0) {
+			snprintf(old_path, PATH_MAX, "/%s", op->old_name);
+		} else {
+			path_join(old_path, PATH_MAX, op->cwd, op->old_name);
+		}
+		snprintf(restore_cmd, sizeof(restore_cmd), "mv '%s' '%s'", op->trash_path, old_path);
+		if (system(restore_cmd) == 0) {
+			snprintf(msg, sizeof(msg), "Restored '%s' from trash.\n", op->old_name);
+			print_to_shell(shell, msg, SHELL_MSG_NORMAL);
+		} else {
+			snprintf(msg, sizeof(msg), "Restore failed for '%s'.\n", op->old_name);
+			print_to_shell(shell, msg, SHELL_MSG_ERROR);
+		}
+		break;
+	case OP_DELETE_PERM:
+		snprintf(msg, sizeof(msg), "Undo perm-delete: '%s' is gone forever.\n", op->old_name);
+		print_to_shell(shell, msg, SHELL_MSG_ERROR);
+		break;
+	}
+}
+
+void files_redo(FilesBuffer *files, struct ShellBuffer *shell) {
+	UndoOp *op;
+	char old_path[PATH_MAX];
+	char new_path[PATH_MAX];
+	char msg[MAX_FILENAME * 2 + 64];
+	if (files->redo_top == 0) {
+		print_to_shell(shell, "Nothing to redo.\n", SHELL_MSG_WARN);
+		return;
+	}
+
+	op = &files->redo_stack[--files->redo_top];
+
+	if (files->undo_top < UNDO_MAX) {
+		files->undo_stack[files->undo_top++] = *op;
+	}
+
+	switch (op->type) {
+	case OP_RENAME:
+		if (strcmp(op->cwd, "/") == 0) {
+			snprintf(old_path, PATH_MAX, "/%s", op->old_name);
+			snprintf(new_path, PATH_MAX, "/%s", op->new_name);
+		} else {
+			path_join(old_path, PATH_MAX, op->cwd, op->old_name);
+			path_join(new_path, PATH_MAX, op->cwd, op->new_name);
+		}
+		if (rename(old_path, new_path) == 0) {
+			snprintf(msg, sizeof(msg), "Redo rename: '%.255s' -> '%.255s'\n", op->old_name, op->new_name);
+			print_to_shell(shell, msg, SHELL_MSG_NORMAL);
+		}
+		break;
+	case OP_TRASH:
+		snprintf(msg, sizeof(msg), "Redo trash not supported.\n");
+		print_to_shell(shell, msg, SHELL_MSG_WARN);
+		break;
+	case OP_DELETE_PERM:
+		snprintf(msg, sizeof(msg), "Redo perm-delete not supported.\n");
+		print_to_shell(shell, msg, SHELL_MSG_WARN);
+		break;
+	}
 }
 
 void files_open_selected(FilesBuffer *files, struct ShellBuffer *shell, WINDOW *files_win, WINDOW *shell_win) {
@@ -850,4 +1156,178 @@ void files_open_selected(FilesBuffer *files, struct ShellBuffer *shell, WINDOW *
 		}
 		needs_resize = 1;
 	}
+}
+
+static void files_move_reindex(FilesBuffer *files) {
+	char full[PATH_MAX];
+
+	for (int i = 0; i < files->entry_count; i++) {
+		path_join(full, sizeof(full), files->cwd, files->entries[i].name);
+		files->in_move_reg[i] = 0;
+		for (int j = 0; j < files->move_reg.count; j++) {
+			if (strcmp(full, files->move_reg.paths[j]) == 0) {
+				files->in_move_reg[i] = 1;
+				break;
+			}
+		}
+	}
+}
+
+static void files_move_print_register(FilesBuffer *files, struct ShellBuffer *shell) {
+	char buf[SHELL_OUTPUT_MAX];
+	int pos;
+
+	if (files->move_reg.count == 0) {
+		print_to_shell(shell, "[move register] (empty)\n", SHELL_MSG_NORMAL);
+		return;
+	}
+	pos = 0;
+	pos += snprintf(buf + pos, sizeof(buf) - pos, "[move register]\n");
+	for (int i = 0; i < files->move_reg.count && pos < (int)sizeof(buf) - 1; i++) {
+		pos += snprintf(buf + pos, sizeof(buf) - pos, "  %s\n", files->move_reg.paths[i]);
+	}
+	print_to_shell(shell, buf, SHELL_MSG_NORMAL);
+}
+
+void files_move_mark(FilesBuffer *files, struct ShellBuffer *shell, int idx) {
+	char full[PATH_MAX];
+
+	if (idx < 0 || idx >= files->entry_count) { return; }
+
+	path_join(full, sizeof(full), files->cwd, files->entries[idx].name);
+
+	for (int j = 0; j < files->move_reg.count; j++) {
+		if (strcmp(files->move_reg.paths[j], full) != 0) { continue; }
+		memmove(files->move_reg.paths[j], files->move_reg.paths[j + 1],
+		        (size_t)(files->move_reg.count - j - 1) * PATH_MAX);
+		files->move_reg.count--;
+		files_move_reindex(files);
+		files_move_print_register(files, shell);
+		return;
+	}
+
+	if (files->move_reg.count >= MOVE_REGISTER_MAX) {
+		print_to_shell(shell, "Move register is full.\n", SHELL_MSG_WARN);
+		return;
+	}
+
+	strncpy(files->move_reg.paths[files->move_reg.count], full, PATH_MAX - 1);
+	files->move_reg.paths[files->move_reg.count][PATH_MAX - 1] = '\0';
+	files->move_reg.count++;
+	files_move_reindex(files);
+	files_move_print_register(files, shell);
+}
+
+void files_move_mark_all(FilesBuffer *files, struct ShellBuffer *shell) {
+	char full[PATH_MAX];
+	int already;
+
+	for (int i = 0; i < files->entry_count; i++) {
+		if (files->sel_count > 0 && !files->multi_sel[i]) { continue; }
+		if (files->move_reg.count >= MOVE_REGISTER_MAX) { break; }
+
+		path_join(full, sizeof(full), files->cwd, files->entries[i].name);
+
+		already = 0;
+		for (int j = 0; j < files->move_reg.count; j++) {
+			if (strcmp(files->move_reg.paths[j], full) == 0) { already = 1; break; }
+		}
+		if (already) { continue; }
+
+		strncpy(files->move_reg.paths[files->move_reg.count], full, PATH_MAX - 1);
+		files->move_reg.paths[files->move_reg.count][PATH_MAX - 1] = '\0';
+		files->move_reg.count++;
+	}
+
+	files_move_reindex(files);
+	files_move_print_register(files, shell);
+}
+
+void files_move_clear(FilesBuffer *files, struct ShellBuffer *shell) {
+	files->move_reg.count = 0;
+	memset(files->in_move_reg, 0, sizeof(files->in_move_reg));
+	print_to_shell(shell, "[move register] cleared\n", SHELL_MSG_NORMAL);
+}
+
+void files_move_paste(FilesBuffer *files, struct ShellBuffer *shell, const char *dest) {
+	char src[PATH_MAX];
+	char dst[PATH_MAX];
+	char msg[PATH_MAX + 64];
+	char mv_cmd[PATH_MAX * 2 + 16];
+	int keep[MOVE_REGISTER_MAX];
+	int any_kept;
+	int new_count;
+	const char *base;
+	struct stat st;
+	size_t srclen;
+
+	if (files->move_reg.count == 0) { return; }
+
+	memset(keep, 0, sizeof(int) * files->move_reg.count);
+	any_kept = 0;
+
+	for (int i = 0; i < files->move_reg.count; i++) {
+		strncpy(src, files->move_reg.paths[i], PATH_MAX - 1);
+		src[PATH_MAX - 1] = '\0';
+
+		base = strrchr(src, '/');
+		base = base ? base + 1 : src;
+
+		if (strcmp(dest, "/") == 0) {
+			snprintf(dst, sizeof(dst), "/%s", base);
+		} else {
+			path_join(dst, sizeof(dst), dest, base);
+		}
+
+		if (strcmp(src, dst) == 0) {
+			snprintf(msg, sizeof(msg), "Move: '%s' is already here.\n", base);
+			print_to_shell(shell, msg, SHELL_MSG_WARN);
+			continue;
+		}
+
+		srclen = strlen(src);
+		if (strncmp(dest, src, srclen) == 0 && (dest[srclen] == '/' || dest[srclen] == '\0')) {
+			snprintf(msg, sizeof(msg), "Move: can't move '%s' into itself.\n", base);
+			print_to_shell(shell, msg, SHELL_MSG_ERROR);
+			keep[i] = 1;
+			any_kept = 1;
+			continue;
+		}
+
+		if (stat(dst, &st) == 0) {
+			snprintf(msg, sizeof(msg), "Move: '%s' already exists at destination.\n", base);
+			print_to_shell(shell, msg, SHELL_MSG_ERROR);
+			keep[i] = 1;
+			any_kept = 1;
+			continue;
+		}
+
+		snprintf(mv_cmd, sizeof(mv_cmd), "mv '%s' '%s'", src, dst);
+		if (system(mv_cmd) == 0) {
+			snprintf(msg, sizeof(msg), "Moved '%s'\n", base);
+			print_to_shell(shell, msg, SHELL_MSG_NORMAL);
+		} else {
+			snprintf(msg, sizeof(msg), "Move failed: '%s'\n", base);
+			print_to_shell(shell, msg, SHELL_MSG_ERROR);
+			keep[i] = 1;
+			any_kept = 1;
+		}
+	}
+
+	if (!any_kept) {
+		files->move_reg.count = 0;
+	} else {
+		new_count = 0;
+		for (int i = 0; i < files->move_reg.count; i++) {
+			if (!keep[i]) { continue; }
+			if (new_count != i) {
+				memcpy(files->move_reg.paths[new_count], files->move_reg.paths[i], PATH_MAX);
+			}
+			new_count++;
+		}
+		files->move_reg.count = new_count;
+		files_move_print_register(files, shell);
+	}
+
+	files_move_reindex(files);
 }

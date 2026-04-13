@@ -18,6 +18,12 @@ typedef enum {
 	BUFFER_INFO,
 } BufferType;
 
+typedef enum {
+	DEL_NONE,
+	DEL_TRASH,
+	DEL_PERM,
+} DeleteMode;
+
 typedef struct {
 	char index_jump_buf[8];
 	char goto_buf[GOTO_BUF_MAX];
@@ -40,6 +46,8 @@ typedef struct {
 	int preview_last_selected;
 	int preview_saved_col_offset;
 	int index_jump_len;
+	int visual_mode;
+	DeleteMode delete_confirm;
 	BufferType active_buffer;
 	BufferType prev_buffer;
 	WINDOW *files_win;

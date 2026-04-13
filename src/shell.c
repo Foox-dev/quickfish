@@ -319,6 +319,7 @@ int print_to_shell(ShellBuffer *shell, const char *text, int type) {
 
 int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WINDOW *shell_win) {
 	char cmd[SHELL_MAX_INPUT];
+	char expanded[SHELL_MAX_INPUT * 4];
 	int len;
 	const char *label;
 	char *endp;
@@ -340,11 +341,39 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WIN
 	char token[MAX_FILENAME];
 	int tok_len;
 	int matched;
+	int was_quoted;
 	char entry_path[PATH_MAX];
 	char rm_cmd[PATH_MAX + 16];
+	char sel_args[SHELL_MAX_INPUT * 3];
+	const char *srch;
+	char *dst;
+	int rem;
+	int n;
 
 	strncpy(cmd, shell->current_input, SHELL_MAX_INPUT - 1);
 	cmd[SHELL_MAX_INPUT - 1] = '\0';
+
+	if (files->sel_count > 0) {
+		files_build_sel_args(files, sel_args, sizeof(sel_args));
+		srch = cmd;
+		dst = expanded;
+		rem = (int)sizeof(expanded) - 1;
+		while (*srch && rem > 0) {
+			if (strncmp(srch, "sel", 3) == 0 &&
+			    (srch == cmd || srch[-1] == ' ') &&
+			    (srch[3] == '\0' || srch[3] == ' ')) {
+				n = snprintf(dst, rem, "%s", sel_args);
+				if (n > 0 && n < rem) { dst += n; rem -= n; }
+				srch += 3;
+			} else {
+				*dst++ = *srch++;
+				rem--;
+			}
+		}
+		*dst = '\0';
+		strncpy(cmd, expanded, SHELL_MAX_INPUT - 1);
+		cmd[SHELL_MAX_INPUT - 1] = '\0';
+	}
 
 	len = (int)strlen(cmd);
 	while (len > 0 && (cmd[len - 1] == ' ' || cmd[len - 1] == '\t')) { cmd[--len] = '\0'; }
@@ -466,13 +495,12 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WIN
 		while (*arg == ' ' || *arg == '\t') { arg++; }
 
 		if (!shell->rm_confirm_mode) {
-			// Phase 1: collect targets and ask for confirmation
+			// Phase 1 collect targets and ask for confirmation
 			dlen = 0;
 			any = 0;
 			scan = arg;
 
-			dlen += snprintf(display + dlen, sizeof(display) - dlen,
-			                 "File(s) to be removed:\n");
+			dlen += snprintf(display + dlen, sizeof(display) - dlen, "File(s) to be removed:\n");
 
 			while (*scan != '\0' && dlen < (int)sizeof(display) - 1) {
 				tok_end = scan;
@@ -483,26 +511,37 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WIN
 				strncpy(token, scan, tok_len);
 				token[tok_len] = '\0';
 
+				was_quoted = 0;
+				if (tok_len >= 2 && token[0] == '\'' && token[tok_len - 1] == '\'') {
+					memmove(token, token + 1, tok_len - 2);
+					token[tok_len - 2] = '\0';
+					was_quoted = 1;
+				}
+
 				scan = tok_end;
 				while (*scan == ' ' || *scan == '\t') { scan++; }
 
 				matched = 0;
-				idx = strtol(token, &endp, 10);
-				if (*endp == '\0' && idx > 0) {
-					for (int i = 0; i < files->entry_count; i++) {
-						if (files->entries[i].index != (int)idx) { continue; }
-						dlen += snprintf(display + dlen, sizeof(display) - dlen,
-						                 "  %s\n", files->entries[i].name);
-						any = 1;
-						matched = 1;
-						break;
+				if (!was_quoted) {
+					idx = strtol(token, &endp, 10);
+					if (*endp == '\0' && idx > 0) {
+						for (int i = 0; i < files->entry_count; i++) {
+							if (files->entries[i].index != (int)idx) { continue; }
+							dlen += snprintf(display + dlen, sizeof(display) - dlen, "  %s\n", files->entries[i].name);
+							any = 1;
+							matched = 1;
+							break;
+						}
+						if (!matched) {
+							print_to_shell(shell, "no entry at that index", SHELL_MSG_ERROR);
+							return 0;
+						}
 					}
 				}
 				if (!matched) {
 					for (int i = 0; i < files->entry_count; i++) {
 						if (strcmp(files->entries[i].name, token) != 0) { continue; }
-						dlen += snprintf(display + dlen, sizeof(display) - dlen,
-						                 "  %s\n", files->entries[i].name);
+						dlen += snprintf(display + dlen, sizeof(display) - dlen, "  %s\n", files->entries[i].name);
 						any = 1;
 						break;
 					}
@@ -518,7 +557,7 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WIN
 				return 0;
 			}
 		} else {
-			// Phase 2: confirmed — execute the deletions
+			// Phase 2 execute the deletions
 			shell->rm_confirm_mode = 0;
 			any = 0;
 			while (*arg != '\0') {
@@ -530,28 +569,37 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WIN
 				strncpy(token, arg, tok_len);
 				token[tok_len] = '\0';
 
+				was_quoted = 0;
+				if (tok_len >= 2 && token[0] == '\'' && token[tok_len - 1] == '\'') {
+					memmove(token, token + 1, tok_len - 2);
+					token[tok_len - 2] = '\0';
+					was_quoted = 1;
+				}
+
 				arg = tok_end;
 				while (*arg == ' ' || *arg == '\t') { arg++; }
 
 				matched = 0;
-				idx = strtol(token, &endp, 10);
-				if (*endp == '\0' && idx > 0) {
-					for (int i = 0; i < files->entry_count; i++) {
-						if (files->entries[i].index != (int)idx) { continue; }
-						if (strcmp(files->cwd, "/") == 0) {
-							snprintf(entry_path, PATH_MAX, "/%s", files->entries[i].name);
-						} else {
-							path_join(entry_path, PATH_MAX, files->cwd, files->entries[i].name);
+				if (!was_quoted) {
+					idx = strtol(token, &endp, 10);
+					if (*endp == '\0' && idx > 0) {
+						for (int i = 0; i < files->entry_count; i++) {
+							if (files->entries[i].index != (int)idx) { continue; }
+							if (strcmp(files->cwd, "/") == 0) {
+								snprintf(entry_path, PATH_MAX, "/%s", files->entries[i].name);
+							} else {
+								path_join(entry_path, PATH_MAX, files->cwd, files->entries[i].name);
+							}
+							if (files->entries[i].type == ENTRY_DIR) {
+								snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", entry_path);
+							} else {
+								snprintf(rm_cmd, sizeof(rm_cmd), "rm '%s'", entry_path);
+							}
+							run_shell(rm_cmd, files->cwd, shell);
+							any = 1;
+							matched = 1;
+							break;
 						}
-						if (files->entries[i].type == ENTRY_DIR) {
-							snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", entry_path);
-						} else {
-							snprintf(rm_cmd, sizeof(rm_cmd), "rm '%s'", entry_path);
-						}
-						run_shell(rm_cmd, files->cwd, shell);
-						any = 1;
-						matched = 1;
-						break;
 					}
 				}
 				if (!matched) {

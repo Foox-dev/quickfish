@@ -1,3 +1,4 @@
+# Maintainer: seaslug foox.dev@gmail.com
 pkgname=quickfish-git
 pkgver=r3.2c3c262
 pkgrel=1
@@ -7,6 +8,7 @@ url="https://github.com/Foox-dev/quickfish"
 license=('GPL2')
 depends=('ncurses')
 makedepends=('git' 'gcc' 'make')
+optdepends=('bat' 'chafa')
 provides=('quickfish')
 conflicts=('quickfish')
 source=("git+$url")
