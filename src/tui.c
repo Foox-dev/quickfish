@@ -1,4 +1,14 @@
+/**
+ * @file tui.c
+ * @brief TUI rendering, input handling, and lifecycle for Quickfish.
+ *
+ * Manages the ncurses windows (file buffer, shell buffer, preview buffer, info
+ * overlay), dispatches keyboard input to the appropriate subsystem, and
+ * owns the resize signal handler.
+ */
+
 #include <dirent.h>
+#include <errno.h>
 #include <limits.h>
 #include <ncurses.h>
 #include <panel.h>
@@ -13,8 +23,8 @@
 #include "main.h"
 #include "tui.h"
 
-#define MIN_COLS 51
-#define MIN_ROWS 25
+#define MIN_COLS 51 ///< Minimum terminal width to run the TUI
+#define MIN_ROWS 25 ///< Minimum terminal height to run the TUI
 
 static void handle_resize(int sig);
 static void info_draw(TUI *tui);
@@ -27,6 +37,7 @@ static void preview_render_file(TUI *tui, const char *path, DirEntry *e, int col
 static void preview_render(TUI *tui, int list_w);
 static void render_goto_overlay(TUI *tui);
 static void render_rename_overlay(TUI *tui);
+static void render_visual_indicator(TUI *tui);
 static void render_quickshell_overlay(TUI *tui, int files_render_w);
 static void render_delete_confirm(TUI *tui, DeleteMode mode);
 static void goto_begin(TUI *tui);
@@ -42,9 +53,13 @@ static void quickshell_begin(TUI *tui);
 static void quickshell_cancel(TUI *tui);
 static void quickshell_execute(TUI *tui);
 static void handle_quickshell_input(TUI *tui, int ch);
-static void move_paste_confirm(TUI *tui);
+static void move_paste_confirm(TUI *tui, const char *dest);
+static void file_cmd_clear(TUI *tui);
+static void files_load_directory_tracked(TUI *tui, const char *path);
+static void files_change_dir_tracked(TUI *tui, const char *dirname);
+static int handle_file_cmd_input(TUI *tui, int ch);
 
-volatile int needs_resize = 0;
+volatile int needs_resize = 0; ///< Flag set by the SIGWINCH handler to indicate that the terminal has been resized and the TUI needs to adjust its layout accordingly
 
 static void handle_resize(int sig) { (void)sig; needs_resize = 1; }
 
@@ -55,6 +70,95 @@ typedef struct {
 	char name[MAX_FILENAME];
 } PreviewEntry;
 
+static void file_cmd_clear(TUI *tui) {
+	tui->file_cmd_len = 0;
+	tui->file_cmd_buf[0] = '\0';
+}
+
+static void files_load_directory_tracked(TUI *tui, const char *path) {
+	if (strcmp(path, tui->files.cwd) == 0) {
+		return;
+	}
+	shell_push_dir(&tui->shell, tui->files.cwd);
+	files_load_directory(&tui->files, path);
+}
+
+static void files_change_dir_tracked(TUI *tui, const char *dirname) {
+	char old_cwd[PATH_MAX];
+
+	snprintf(old_cwd, sizeof(old_cwd), "%s", tui->files.cwd);
+	files_change_dir(&tui->files, dirname);
+	if (strcmp(old_cwd, tui->files.cwd) != 0) {
+		shell_push_dir(&tui->shell, old_cwd);
+	}
+}
+
+static int handle_file_cmd_input(TUI *tui, int ch) {
+	if (tui->file_cmd_len > 0 && tui->file_cmd_buf[0] == '.') {
+		switch (ch) {
+		case 27:
+		case '\n':
+		case '\r':
+		case KEY_ENTER:
+		case KEY_DC:
+			file_cmd_clear(tui);
+			return 1;
+		case '\x7f':
+		case KEY_BACKSPACE:
+			if (tui->file_cmd_len > 0) {
+				tui->file_cmd_len--;
+				tui->file_cmd_buf[tui->file_cmd_len] = '\0';
+			}
+			return 1;
+		default:
+			if (ch >= 32 && ch < 127 && tui->file_cmd_len < FILE_CMD_BUF_MAX - 1) {
+				tui->file_cmd_buf[tui->file_cmd_len++] = (unsigned char)ch;
+				tui->file_cmd_buf[tui->file_cmd_len] = '\0';
+			}
+			if (strcmp(tui->file_cmd_buf, "..") == 0) {
+				shell_jump_prev_dir(&tui->shell, &tui->files);
+				file_cmd_clear(tui);
+			}
+			return 1;
+		}
+	}
+
+	if (ch >= '0' && ch <= '9') {
+		if (tui->file_cmd_len < FILE_CMD_BUF_MAX - 1) {
+			tui->file_cmd_buf[tui->file_cmd_len++] = (unsigned char)ch;
+			tui->file_cmd_buf[tui->file_cmd_len] = '\0';
+		}
+		return 1;
+	}
+
+	if (ch == '.') {
+		if (tui->file_cmd_len > 0 && tui->file_cmd_buf[0] != '.') {
+			file_cmd_clear(tui);
+		}
+		if (tui->file_cmd_len < FILE_CMD_BUF_MAX - 1) {
+			tui->file_cmd_buf[tui->file_cmd_len++] = '.';
+			tui->file_cmd_buf[tui->file_cmd_len] = '\0';
+		}
+		if (strcmp(tui->file_cmd_buf, "..") == 0) {
+			shell_jump_prev_dir(&tui->shell, &tui->files);
+			file_cmd_clear(tui);
+		}
+		return 1;
+	}
+
+	return 0;
+}
+
+/**
+ * @brief Comparator for sorting preview entries.
+ *
+ * Directories are sorted before files, and within each group
+ * entries are sorted alphabetically (case-insensitive).
+ *
+ * @param a Pointer to the first PreviewEntry.
+ * @param b Pointer to the second PreviewEntry.
+ * @return Negative if "a" comes first, positive if "b" comes first, "ero if equal.
+ */
 static int preview_entry_cmp(const void *a, const void *b) {
 	const PreviewEntry *ea;
 	const PreviewEntry *eb;
@@ -67,6 +171,18 @@ static int preview_entry_cmp(const void *a, const void *b) {
 	return strcasecmp(ea->name, eb->name);
 }
 
+/**
+ * @brief Applies a single keypress to an editable text buffer.
+ *
+ * Handles cursor movement, insertion, backspace, and delete-forward.
+ * Used by the goto, rename, and quickshell overlays.
+ *
+ * @param buf 	 The text buffer (null-terminated, caller-owned).
+ * @param len 	 Current length of text in buf (updated in place).
+ * @param cursor Current cursor position within buf (updated in place).
+ * @param max 	 Maximum capacity of buf including the null terminator.
+ * @param ch 		 ncurses key value to process.
+ */
 static void edit_handle_ch(char *buf, int *len, int *cursor, int max, int ch) {
 	if (ch == KEY_LEFT) {
 		if (*cursor > 0) { (*cursor)--; }
@@ -89,11 +205,13 @@ static void edit_handle_ch(char *buf, int *len, int *cursor, int max, int ch) {
 		}
 	} else if (ch >= 32 && ch < 127 && *len < max - 1) {
 		memmove(buf + *cursor + 1, buf + *cursor, (size_t)(*len - *cursor + 1));
-		buf[(*cursor)++] = (char)ch;
+		buf[(*cursor)++] = (unsigned char)ch;
 		(*len)++;
 	}
 }
 
+/* Tears down and recreates all ncurses windows to match the current terminal size.
+   Called once on init and again after every SIGWINCH. */
 static void rebuild_windows(TUI *tui) {
 	getmaxyx(stdscr, tui->max_y, tui->max_x);
 
@@ -116,6 +234,15 @@ static void rebuild_windows(TUI *tui) {
 	}
 }
 
+/**
+ * @brief Initialises ncurses and allocates a TUI instance.
+ *
+ * Sets up color pairs, creates the files and shell windows, loads the
+ * starting directory, and installs the SIGWINCH handler.
+ *
+ * @param start_dir Initial directory to display. If NULL or empty the function falls back to $HOME, then getpwuid, then ".".
+ * @return Heap-allocated TUI on success, NULL on allocation or window failure.
+ */
 TUI *tui_init(const char *start_dir) {
 	TUI *tui;
 	char resolved[PATH_MAX];
@@ -200,6 +327,13 @@ TUI *tui_init(const char *start_dir) {
 	return tui;
 }
 
+/**
+ * @brief Tears down ncurses and frees the TUI.
+ *
+ * Safe to call with a NULL pointer.
+ *
+ * @param tui The TUI instance to destroy.
+ */
 void tui_cleanup(TUI *tui) {
 	if (!tui) { return; }
 	if (tui->files_win) { delwin(tui->files_win); }
@@ -210,6 +344,14 @@ void tui_cleanup(TUI *tui) {
 	free(tui);
 }
 
+/**
+ * @brief Responds to a pending terminal resize.
+ *
+ * Should be called at the top of the main loop whenever needs_resize is set.
+ * Resets the flag, rebuilds all windows, and forces a full redraw.
+ *
+ * @param tui The TUI instance to resize.
+ */
 void tui_resize_handler(TUI *tui) {
 	if (!needs_resize) { return; }
 	needs_resize = 0;
@@ -227,6 +369,18 @@ void tui_resize_handler(TUI *tui) {
 	wrefresh(stdscr);
 }
 
+/**
+ * @brief Renders a directory listing into the preview buffer.
+ *
+ * Reads up to 4096 entries, sorts them (dirs first, then alphabetically),
+ * and draws them with appropriate color pairs. Respects tui->preview_scroll.
+ *
+ * @param tui			 The TUI instance.
+ * @param path		 Absolute path of the directory to preview.
+ * @param col			 Starting column in files_win to draw into.
+ * @param avail		 Available column width for entry names.
+ * @param max_rows Maximum number of rows to render.
+ */
 static void preview_render_dir(TUI *tui, const char *path, int col, int avail, int max_rows) {
 	DIR *d;
 	PreviewEntry *names;
@@ -254,8 +408,7 @@ static void preview_render_dir(TUI *tui, const char *path, int col, int avail, i
 
 	while ((de = readdir(d)) && total < 4096) {
 		if (de->d_name[0] == '.') { continue; }
-		strncpy(names[total].name, de->d_name, MAX_FILENAME - 1);
-		names[total].name[MAX_FILENAME - 1] = '\0';
+		snprintf(names[total].name, sizeof(names[total].name), "%s", de->d_name);
 		path_join(entry_path, PATH_MAX, path, de->d_name);
 		if (stat(entry_path, &st) == 0) {
 			names[total].is_dir = S_ISDIR(st.st_mode);
@@ -311,15 +464,16 @@ static void preview_render_dir(TUI *tui, const char *path, int col, int avail, i
 	free(names);
 }
 
-#define BAT_CACHE_BUF (512 * 1024)
-#define BAT_CACHE_LMAX 4096
+#define BAT_CACHE_BUF (512 * 1024) ///< Maximum bytes buffered from a bat(1) subprocess
+#define BAT_CACHE_LMAX 4096 ///< Maximum number of lines indexed in the bat cache
 
-static char bat_path_cache[PATH_MAX];
-static char bat_buf[BAT_CACHE_BUF];
-static char *bat_lines[BAT_CACHE_LMAX];
-static int bat_nlines = 0;
-static int bat_valid = 0;
+static char bat_path_cache[PATH_MAX]; ///< Path of the file currently held in the bat cache
+static char bat_buf[BAT_CACHE_BUF]; ///< Raw output buffer from the last bat(1) run
+static char *bat_lines[BAT_CACHE_LMAX]; ///< Pointers into bat_buf, one per line
+static int bat_nlines = 0; ///< Number of valid entries in bat_lines
+static int bat_valid = 0; ///< Non-zero when bat_buf holds usable content for bat_path_cache
 
+/* Returns 1 if bat(1) is on PATH, 0 otherwise. Result is cached after the first call. */
 static int bat_available(void) {
 	static int result = -1;
 	FILE *f;
@@ -331,10 +485,14 @@ static int bat_available(void) {
 	return result;
 }
 
+/* Maps 24-bit RGB to the nearest xterm-256 color index. */
 static short rgb_to_256(int r, int g, int b) {
 	return (short)(16 + 36 * ((r * 5 + 127) / 255) + 6 * ((g * 5 + 127) / 255) + ((b * 5 + 127) / 255));
 }
 
+/* Returns an ncurses color-pair number for the given xterm-256 foreground index,
+	 allocating a new pair on first use. Returns 0 if the terminal has too few colors
+	 or if the dynamic pair pool is exhausted. */
 static short bat_color_pair(short fg) {
 	static short cache[256];
 	static int ready = 0;
@@ -352,6 +510,18 @@ static short bat_color_pair(short fg) {
 	return cache[fg];
 }
 
+/**
+ * @brief Renders one ANSI-escaped line from bat(1) into an ncurses window.
+ *
+ * Parses SGR escape sequences inline, mapping colors and attributes to
+ * ncurses equivalents. Non-printable or unrecognised sequences are skipped.
+ *
+ * @param win   Target ncurses window.
+ * @param row   Row to write into.
+ * @param col   Starting column.
+ * @param avail Maximum number of visible characters to write.
+ * @param s     Null-terminated ANSI-escaped string to render.
+ */
 static void render_bat_line(WINDOW *win, int row, int col, int avail, const char *s) {
 	attr_t attrs = A_NORMAL;
 	short fg = -1;
@@ -387,8 +557,8 @@ static void render_bat_line(WINDOW *win, int row, int col, int avail, const char
 		np = 0;
 		while (np < 16) {
 			char *end;
-			params[np] = (int)strtol(s, &end, 10);
-			if (end == s) { params[np] = 0; }
+			long pv = strtol(s, &end, 10);
+			params[np] = (end == s) ? 0 : (pv < 0 ? 0 : pv > 255 ? 255 : (int)pv);
 			np++;
 			s = end;
 			if (*s == ';') { s++; } else { break; }
@@ -412,7 +582,8 @@ static void render_bat_line(WINDOW *win, int row, int col, int avail, const char
 				fg = (short)(params[i] - 90 + 8); break;
 			case 38:
 				if (i + 2 < np && params[i + 1] == 5) {
-					fg = (short)params[i + 2]; i += 2;
+					int c = params[i + 2];
+					fg = (c >= 0 && c <= 255) ? (short)c : -1; i += 2;
 				} else if (i + 4 < np && params[i + 1] == 2) {
 					fg = rgb_to_256(params[i+2], params[i+3], params[i+4]);
 					i += 4;
@@ -425,6 +596,15 @@ static void render_bat_line(WINDOW *win, int row, int col, int avail, const char
 	wstandend(win);
 }
 
+/**
+ * @brief Populates the bat cache by running bat(1) on the given file.
+ *
+ * Shell-escapes the path, spawns bat with plain style and no pager, reads
+ * up to BAT_CACHE_BUF bytes, then splits the output into lines stored in
+ * bat_lines[]. Sets bat_valid on success.
+ *
+ * @param path Absolute path of the file to render.
+ */
 static void bat_fill_cache(const char *path) {
 	char cmd[PATH_MAX * 2 + 256];
 	char esc[PATH_MAX * 2];
@@ -479,6 +659,20 @@ static void bat_fill_cache(const char *path) {
 	bat_valid = (total > 0) ? 1 : 0;
 }
 
+/**
+ * @brief Renders a file's contents into the preview column.
+ *
+ * Uses bat(1) with ANSI color if available, falling back to plain fread.
+ * Binary files and media types (image, video, audio, archive) display a
+ * short label instead of content. Respects tui->preview_scroll.
+ *
+ * @param tui      The TUI instance.
+ * @param path     Absolute path of the file to preview.
+ * @param e        DirEntry for the file (used for extension-based color).
+ * @param col      Starting column in files_win to draw into.
+ * @param avail    Available column width.
+ * @param max_rows Maximum number of rows to render.
+ */
 static void preview_render_file(TUI *tui, const char *path, DirEntry *e, int col, int avail, int max_rows) {
 	FILE *f;
 	char peek[512];
@@ -595,6 +789,16 @@ static void preview_render_file(TUI *tui, const char *path, DirEntry *e, int col
 	fclose(f);
 }
 
+/**
+ * @brief Draws the preview pane for the currently selected entry.
+ *
+ * Renders a vertical divider, a title bar, and delegates to either
+ * preview_render_dir() or preview_render_file() depending on entry type.
+ * Resets preview_scroll when the selection changes.
+ *
+ * @param tui    The TUI instance.
+ * @param list_w Width in columns occupied by the file list pane.
+ */
 static void preview_render(TUI *tui, int list_w) {
 	int preview_w;
 	int height;
@@ -646,6 +850,7 @@ static void preview_render(TUI *tui, int list_w) {
 	wnoutrefresh(tui->files_win);
 }
 
+/* Draws the GOTO prompt centred on the title row and positions the cursor. */
 static void render_goto_overlay(TUI *tui) {
 	char label[GOTO_BUF_MAX + 16];
 	int llen;
@@ -664,6 +869,7 @@ static void render_goto_overlay(TUI *tui) {
 	wnoutrefresh(tui->files_win);
 }
 
+/* Draws the RENAME prompt on the title row with an inline editable field. */
 static void render_rename_overlay(TUI *tui) {
 	const char *prefix;
 	char label[RENAME_BUF_MAX + 16];
@@ -693,6 +899,28 @@ static void render_rename_overlay(TUI *tui) {
 	wnoutrefresh(tui->files_win);
 }
 
+static void render_visual_indicator(TUI *tui) {
+	int llen;
+	int lx;
+
+	llen = (int)strlen(" VISUAL ");
+	lx = (tui->max_x - llen) / 2;
+	if (lx < 0) { lx = 0; }
+	wattron(tui->files_win, COLOR_PAIR(CP_TITLE_F) | A_BOLD);
+	mvwprintw(tui->files_win, 0, lx, " VISUAL ");
+	wattroff(tui->files_win, COLOR_PAIR(CP_TITLE_F) | A_BOLD);
+	wnoutrefresh(tui->files_win);
+}
+
+/**
+ * @brief Draws the quickshell input bar at the bottom of the files pane.
+ *
+ * Renders the ":" prompt, the current input buffer, and a ghost completion
+ * hint (dimmed) if one is available.
+ *
+ * @param tui            The TUI instance.
+ * @param files_render_w Width of the files pane in columns.
+ */
 static void render_quickshell_overlay(TUI *tui, int files_render_w) {
 	int qrow;
 	int avail;
@@ -727,6 +955,15 @@ static void render_quickshell_overlay(TUI *tui, int files_render_w) {
 	wnoutrefresh(tui->files_win);
 }
 
+/**
+ * @brief Renders a complete frame of the TUI.
+ *
+ * Draws the horizontal divider, file buffer, shell buffer, and any active
+ * overlay (preview, goto, rename, quickshell, info). Falls back to a
+ * "terminal too small" message when dimensions are below the minimum.
+ *
+ * @param tui The TUI instance.
+ */
 void tui_render(TUI *tui) {
 	int files_render_w;
 	int preview_w;
@@ -766,18 +1003,17 @@ void tui_render(TUI *tui) {
 		files_render_w = tui->max_x - preview_w - 1;
 	}
 
-	files_render(&tui->files, tui->files_win,
-	             tui->files_height, files_render_w,
+	files_render(&tui->files, tui->files_win, tui->files_height, files_render_w,
 	             tui->active_buffer == BUFFER_FILES);
 
-	if (tui->index_jump_len > 0 && tui->files_win) {
+	if (tui->file_cmd_len > 0 && tui->files_win) {
 		cwd_avail = files_render_w - 9;
 		cwdlen = (int)strlen(tui->files.cwd);
 		if (cwdlen > cwd_avail) { cwdlen = cwd_avail; }
 		jump_x = 9 + cwdlen + 1;
 		if (jump_x < files_render_w) {
 			wattron(tui->files_win, COLOR_PAIR(CP_PROMPT) | A_BOLD);
-			mvwprintw(tui->files_win, 0, jump_x, "%s", tui->index_jump_buf);
+			mvwprintw(tui->files_win, 0, jump_x, "%s", tui->file_cmd_buf);
 			wattroff(tui->files_win, COLOR_PAIR(CP_PROMPT) | A_BOLD);
 			wnoutrefresh(tui->files_win);
 		}
@@ -801,7 +1037,9 @@ void tui_render(TUI *tui) {
 		info_draw(tui);
 		show_panel(tui->info_panel);
 	}
-
+	if (tui->visual_mode && tui->files_win) {
+		render_visual_indicator(tui);
+	}
 	update_panels();
 
 	if (tui->rename_mode && tui->files_win && tui->files.entry_count > 0) {
@@ -817,6 +1055,7 @@ void tui_render(TUI *tui) {
 	doupdate();
 }
 
+/* Renders the F1 help overlay into info_win. */
 static void info_draw(TUI *tui) {
 	int w;
 	int row;
@@ -835,10 +1074,8 @@ static void info_draw(TUI *tui) {
 	row++;
 
 	wattron(tui->info_win, A_BOLD);
-	mvwprintw(tui->info_win, row++, 2, "Quickfish - a tui filemanager designed to remove the need for GUI alternatives ");
+	mvwprintw(tui->info_win, row++, 2, "Quickfish Help");
 	wattroff(tui->info_win, A_BOLD);
-	mvwprintw(tui->info_win, row++, 2, "Released under GPL-2.0 license.");
-	row++;
 
 	wattron(tui->info_win, A_BOLD | A_UNDERLINE);
 	mvwprintw(tui->info_win, row++, 2, "Navigation");
@@ -846,50 +1083,43 @@ static void info_draw(TUI *tui) {
 	IROW("  j / Down   : move down",                "  k / Up     : move up");
 	IROW("  h / Left   : go to parent dir",         "  l / Right  : enter dir or open file");
 	IROW("  Enter      : enter dir or open file",   "  Ctrl+D / U : half-page down / up");
-	row++;
 
 	wattron(tui->info_win, A_BOLD | A_UNDERLINE);
-	mvwprintw(tui->info_win, row++, 2, "File Manager");
+	mvwprintw(tui->info_win, row++, 2, "Files");
 	wattroff(tui->info_win, A_BOLD | A_UNDERLINE);
-	IROW("  g          : go to path or name",       "  r          : rename selected entry");
-	IROW("  p          : toggle preview pane",      "  :          : quickshell (inline cmd)");
+	IROW("  g          : go to path or name",       "  <num>g     : go to dir by index");
+	IROW("  ..         : previous directory",       "  r          : rename selected entry");
+	IROW("  :          : quickshell (inline cmd)",  "  F1         : open this help");
 	IROW("  s          : toggle-select item",       "  v          : sweep/visual select mode");
 	IROW("  d          : trash selected / selection", "  D          : permanently delete");
-	IROW("  u / U      : undo / redo last op",      "  F1         : this help screen");
-	IROW("  m          : mark file for move",       "  M          : mark selection for move");
-	IROW("  p          : paste move register",      "  Ctrl+C     : clear move register");
-	row++;
+	IROW("  u / U      : undo / redo last op",      "  m          : mark file for move");
+	IROW("  M          : mark selection for move",  "  Ctrl+C     : clear move register");
+	IROW("  p          : paste register here",      "  P          : paste into selected dir");
 
 	wattron(tui->info_win, A_BOLD | A_UNDERLINE);
-	mvwprintw(tui->info_win, row++, 2, "Pane Switching");
+	mvwprintw(tui->info_win, row++, 2, "Preview / Panes");
 	wattroff(tui->info_win, A_BOLD | A_UNDERLINE);
+	IROW("  Ctrl+P     : open preview pane",        "  p (preview): close preview pane");
 	IROW("  K / S-Down : focus files pane",         "  J / S-Up   : focus shell pane");
 	IROW("  L / S-Right: focus next pane",          "  H / S-Left : focus previous pane");
-	row++;
 
 	wattron(tui->info_win, A_BOLD | A_UNDERLINE);
 	mvwprintw(tui->info_win, row++, 2, "Shell Commands");
 	wattroff(tui->info_win, A_BOLD | A_UNDERLINE);
-	IROW("  <Enter>    : spawn interactive shell",  "  q          : quit");
-	IROW("  cd <path>  : change directory",         "  cd <num>   : cd to dir by index");
-	IROW("  <num>      : cd to dir by index",       "  ..         : jump to previous dir");
+	IROW("  q          : quit",                      "  cd <path>  : change directory");
+	IROW("  cd <num>/<num>: cd to dir by index",    "  ..         : jump to previous dir");
 	IROW("  s <file>   : stat a file or index",     "  r / rm <n> : remove by index or name");
 
 #undef IROW
 
-	row++;
 	wattron(tui->info_win, A_DIM);
-	mvwprintw(tui->info_win, row++, 2, "Note: this page (and quickfish itself) is still in heavy development.");
-	mvwprintw(tui->info_win, row++, 2, "Things are subject to change!");
-	wattroff(tui->info_win, A_DIM);
-
-	wattron(tui->info_win, A_DIM);
-	mvwprintw(tui->info_win, tui->max_y - 2, 2, "%-*.*s", w, w, "Press any key to return.");
+	mvwprintw(tui->info_win, tui->max_y - 2, 2, "%-*.*s", w, w, "Press any key to close.");
 	wattroff(tui->info_win, A_DIM);
 
 	wnoutrefresh(tui->info_win);
 }
 
+/* Toggles the F1 info overlay */
 static void info_toggle(TUI *tui) {
 	if (tui->info_mode) {
 		tui->info_mode = 0;
@@ -906,37 +1136,29 @@ static void info_toggle(TUI *tui) {
 	}
 }
 
-void tui_run(TUI *tui) {
-	int ch;
-	while (tui->running) {
-		if (needs_resize) {
-			tui_resize_handler(tui);
-			continue;
-		}
-		tui_render(tui);
-		ch = wgetch(stdscr);
-		if (ch == KEY_RESIZE) {
-			needs_resize = 1;
-			continue;
-		}
-		if (ch != ERR) {
-			tui_handle_input(tui, ch);
-		}
-	}
-}
-
+/* Activates goto mode and clears the input buffer. */
 static void goto_begin(TUI *tui) {
 	tui->goto_mode = 1;
 	tui->goto_len = 0;
 	tui->goto_buf[0] = '\0';
 }
 
+/* Cancels goto mode and clears the input buffer. */
 static void goto_cancel(TUI *tui) {
 	tui->goto_mode = 0;
 	tui->goto_len = 0;
 	tui->goto_buf[0] = '\0';
 }
 
+/**
+ * @brief Resolves and navigates to the path in the goto buffer.
+ *
+ * Resolution order: exact absolute/relative path, numeric index jump,
+ * exact name match in the current (or specified) directory, then prefix
+ * match. Navigates into directories. Selecting files is not supported.
+ *
+ * @param tui The TUI instance.
+ */
 static void goto_confirm(TUI *tui) {
 	char target[PATH_MAX];
 	struct stat st;
@@ -968,7 +1190,7 @@ static void goto_confirm(TUI *tui) {
 	}
 
 	if (stat(target, &st) == 0) {
-		if (S_ISDIR(st.st_mode)) { files_load_directory(&tui->files, target); }
+		if (S_ISDIR(st.st_mode)) { files_load_directory_tracked(tui, target); }
 		return;
 	}
 
@@ -979,12 +1201,10 @@ static void goto_confirm(TUI *tui) {
 
 	if (last_slash && last_slash != dir_buf) {
 		*last_slash = '\0';
-		strncpy(search_dir, dir_buf, PATH_MAX - 1);
-		search_dir[PATH_MAX - 1] = '\0';
+		snprintf(search_dir, sizeof(search_dir), "%s", dir_buf);
 		search_name = last_slash + 1;
 	} else {
-		strncpy(search_dir, tui->files.cwd, PATH_MAX - 1);
-		search_dir[PATH_MAX - 1] = '\0';
+		snprintf(search_dir, sizeof(search_dir), "%s", tui->files.cwd);
 		search_name = tui->goto_buf;
 	}
 
@@ -994,7 +1214,7 @@ static void goto_confirm(TUI *tui) {
 			for (int i = 0; i < tui->files.entry_count; i++) {
 				if (tui->files.entries[i].index != (int)idx) { continue; }
 				e = &tui->files.entries[i];
-				if (e->type == ENTRY_DIR) { files_change_dir(&tui->files, e->name); }
+				if (e->type == ENTRY_DIR) { files_change_dir_tracked(tui, e->name); }
 				return;
 			}
 			return;
@@ -1011,11 +1231,11 @@ static void goto_confirm(TUI *tui) {
 	while ((de = readdir(d))) {
 		if (de->d_name[0] == '.') { continue; }
 		if (strcasecmp(de->d_name, search_name) == 0 && !exact[0]) {
-			strncpy(exact, de->d_name, MAX_FILENAME - 1);
+			snprintf(exact, sizeof(exact), "%s", de->d_name);
 		} else if (slen > 0 &&
 		           strncasecmp(de->d_name, search_name, slen) == 0 &&
 		           !prefix_m[0]) {
-			strncpy(prefix_m, de->d_name, MAX_FILENAME - 1);
+			snprintf(prefix_m, sizeof(prefix_m), "%s", de->d_name);
 		}
 	}
 	closedir(d);
@@ -1024,16 +1244,25 @@ static void goto_confirm(TUI *tui) {
 	if (!match[0]) { return; }
 
 	use = realpath(search_dir, resolved) ? resolved : search_dir;
-	if (strcmp(use, tui->files.cwd) != 0) { files_load_directory(&tui->files, use); }
+	if (strcmp(use, tui->files.cwd) != 0) { files_load_directory_tracked(tui, use); }
 
 	for (int i = 0; i < tui->files.entry_count; i++) {
 		if (strcasecmp(tui->files.entries[i].name, match) != 0) { continue; }
 		e = &tui->files.entries[i];
-		if (e->type == ENTRY_DIR) { files_change_dir(&tui->files, e->name); }
+		if (e->type == ENTRY_DIR) { files_change_dir_tracked(tui, e->name); }
 		return;
 	}
 }
 
+/**
+ * @brief Tab-completes the current goto buffer against the filesystem.
+ *
+ * Splits the buffer into a directory part and a name prefix, then calls
+ * complete_in_dir() to find a match. On success the buffer is updated in
+ * place with the completed name.
+ *
+ * @param tui The TUI instance.
+ */
 static void goto_tab_complete(TUI *tui) {
 	char dir_part[PATH_MAX];
 	char name_part[MAX_FILENAME];
@@ -1079,6 +1308,7 @@ static void goto_tab_complete(TUI *tui) {
 	tui->goto_len = (int)strlen(tui->goto_buf);
 }
 
+/* Activates rename mode, pre-filling the buffer with the selected entry's name. */
 static void rename_begin(TUI *tui) {
 	DirEntry *e;
 
@@ -1091,6 +1321,14 @@ static void rename_begin(TUI *tui) {
 	tui->rename_cursor = tui->rename_len;
 }
 
+/**
+ * @brief Applies the rename buffer to the selected entry and records an undo op.
+ *
+ * No-ops if the name is unchanged or the buffer is empty. Pushes an OP_RENAME
+ * onto the undo stack, evicting the oldest entry if the stack is full.
+ *
+ * @param tui The TUI instance.
+ */
 static void rename_commit(TUI *tui) {
 	DirEntry *e;
 	char old_path[PATH_MAX];
@@ -1119,18 +1357,12 @@ static void rename_commit(TUI *tui) {
 	op.new_name[MAX_FILENAME - 1] = '\0';
 	op.trash_path[0] = '\0';
 
-	if (tui->files.undo_top < UNDO_MAX) {
-		tui->files.undo_stack[tui->files.undo_top++] = op;
-	} else {
-		memmove(&tui->files.undo_stack[0], &tui->files.undo_stack[1],
-		        (UNDO_MAX - 1) * sizeof(UndoOp));
-		tui->files.undo_stack[UNDO_MAX - 1] = op;
-	}
-	tui->files.redo_top = 0;
-
+	push_undo(&tui->files, op);
+	
 	files_load_directory(&tui->files, tui->files.cwd);
 }
 
+/* Cancels rename mode and hides the cursor. */
 static void rename_cancel(TUI *tui) {
 	tui->rename_mode = 0;
 	tui->rename_len = 0;
@@ -1139,6 +1371,7 @@ static void rename_cancel(TUI *tui) {
 	curs_set(0);
 }
 
+/* Dispatches a keypress while rename mode is active. */
 static void handle_rename_input(TUI *tui, int ch) {
 	switch (ch) {
 	case 27:
@@ -1154,6 +1387,7 @@ static void handle_rename_input(TUI *tui, int ch) {
 	}
 }
 
+/* Dispatches a keypress while goto mode is active. */
 static void handle_goto_input(TUI *tui, int ch) {
 	switch (ch) {
 	case 27:
@@ -1171,13 +1405,14 @@ static void handle_goto_input(TUI *tui, int ch) {
 		break;
 	default:
 		if (ch >= 32 && ch < 127 && tui->goto_len < GOTO_BUF_MAX - 1) {
-			tui->goto_buf[tui->goto_len++] = (char)ch;
+			tui->goto_buf[tui->goto_len++] = (unsigned char)ch;
 			tui->goto_buf[tui->goto_len] = '\0';
 		}
 		break;
 	}
 }
 
+/* Activates quickshell mode and clears the input buffer. */
 static void quickshell_begin(TUI *tui) {
 	tui->quickshell_mode = 1;
 	tui->quickshell_len = 0;
@@ -1185,6 +1420,7 @@ static void quickshell_begin(TUI *tui) {
 	tui->quickshell_buf[0] = '\0';
 }
 
+/* Cancels quickshell mode, clears the buffer, and hides the cursor. */
 static void quickshell_cancel(TUI *tui) {
 	tui->quickshell_mode = 0;
 	tui->quickshell_len = 0;
@@ -1193,6 +1429,15 @@ static void quickshell_cancel(TUI *tui) {
 	curs_set(0);
 }
 
+/**
+ * @brief Commits the quickshell buffer to the shell and executes it.
+ *
+ * Copies the buffer into shell.current_input, cancels quickshell mode,
+ * then calls execute_given(). If the command requests rm confirmation the
+ * focus is moved to the shell pane so the user can answer the prompt.
+ *
+ * @param tui The TUI instance.
+ */
 static void quickshell_execute(TUI *tui) {
 	if (tui->quickshell_len == 0) { quickshell_cancel(tui); return; }
 	strncpy(tui->shell.current_input, tui->quickshell_buf, SHELL_MAX_INPUT - 1);
@@ -1208,6 +1453,7 @@ static void quickshell_execute(TUI *tui) {
 	refresh_files_buffer(&tui->files);
 }
 
+/* Dispatches a keypress while quickshell mode is active. */
 static void handle_quickshell_input(TUI *tui, int ch) {
 	switch (ch) {
 	case 27:
@@ -1222,6 +1468,16 @@ static void handle_quickshell_input(TUI *tui, int ch) {
 	}
 }
 
+/**
+ * @brief Shows a modal confirmation dialog for delete or trash operations.
+ *
+ * Builds a popup sized to the action description, waits for y/n/Esc,
+ * then calls the appropriate files_delete_* function if confirmed.
+ * Forces a full redraw after the popup is dismissed.
+ *
+ * @param tui  The TUI instance.
+ * @param mode DEL_TRASH to move to trash, DEL_PERM to permanently delete.
+ */
 static void render_delete_confirm(TUI *tui, DeleteMode mode) {
 	const char *action;
 	const char *warning;
@@ -1251,7 +1507,7 @@ static void render_delete_confirm(TUI *tui, DeleteMode mode) {
 		snprintf(target, sizeof(target), "%d items", tui->files.sel_count);
 	} else if (e) {
 		const char *kind = (e->type == ENTRY_DIR) ? "directory" : "file";
-		snprintf(target, sizeof(target), "'%.40s' (%s)", e->name, kind);
+		snprintf(target, sizeof(target), "'%.30s' (%s)", e->name, kind);
 	} else {
 		return;
 	}
@@ -1333,7 +1589,15 @@ static void render_delete_confirm(TUI *tui, DeleteMode mode) {
 	touchwin(tui->shell_win);
 }
 
-static void move_paste_confirm(TUI *tui) {
+/**
+ * @brief Shows a modal confirmation dialog before pasting the move register.
+ *
+ * Pastes into dest if confirmed. Forces a full redraw on dismissal.
+ *
+ * @param tui  The TUI instance.
+ * @param dest Destination path for the pending move batch.
+ */
+static void move_paste_confirm(TUI *tui, const char *dest) {
 	char body[80];
 	int body_len;
 	int w_width;
@@ -1345,7 +1609,7 @@ static void move_paste_confirm(TUI *tui) {
 	WINDOW *popup;
 
 	snprintf(body, sizeof(body), "Move %d file(s) to '%.*s'?",
-	         tui->files.move_reg.count, 40, tui->files.cwd);
+	         tui->files.move_reg.count, 40, dest);
 	body_len = (int)strlen(body);
 	w_width = body_len + 6;
 	if (w_width < 46) { w_width = 46; }
@@ -1382,7 +1646,7 @@ static void move_paste_confirm(TUI *tui) {
 	delwin(popup);
 
 	if (confirmed) {
-		files_move_paste(&tui->files, &tui->shell, tui->files.cwd);
+		files_move_paste(&tui->files, &tui->shell, dest);
 	}
 
 	clearok(curscr, TRUE);
@@ -1390,6 +1654,16 @@ static void move_paste_confirm(TUI *tui) {
 	touchwin(tui->shell_win);
 }
 
+/**
+ * @brief Handles input while the preview pane is focused.
+ *
+ * Supports scrolling (j/k, Ctrl+D/U), opening quickshell (':'), and
+ * toggling the preview pane off ('p'). Quickshell keypresses are forwarded
+ * immediately if quickshell mode is already active.
+ *
+ * @param tui The TUI instance.
+ * @param ch  ncurses key value.
+ */
 void tui_handle_preview_input(TUI *tui, int ch) {
 	if (tui->quickshell_mode) { handle_quickshell_input(tui, ch); return; }
 
@@ -1418,29 +1692,46 @@ void tui_handle_preview_input(TUI *tui, int ch) {
 	}
 }
 
+/**
+ * @brief Handles input while the files pane is focused.
+ *
+ * Forwards to the active overlay handler (rename, goto, quickshell) if one
+ * is open. Otherwise processes navigation, selection, deletion, move/paste,
+ * undo/redo, and mode-toggle keys. Digits accumulate in file_cmd_buf for
+ * index-based jumping, and ".." jumps to the previous directory.
+ *
+ * @param tui The TUI instance.
+ * @param ch  ncurses key value.
+ */
 void tui_handle_files_input(TUI *tui, int ch) {
 	DirEntry *e;
-	int idx;
+	long idx;
 	char *endp;
+	char dest[PATH_MAX];
 
 	if (tui->rename_mode) { handle_rename_input(tui, ch); return; }
 	if (tui->goto_mode) { handle_goto_input(tui, ch); return; }
 	if (tui->quickshell_mode) { handle_quickshell_input(tui, ch); return; }
 
-	if (ch >= '0' && ch <= '9') {
-		if (tui->index_jump_len < (int)sizeof(tui->index_jump_buf) - 1) {
-			tui->index_jump_buf[tui->index_jump_len++] = (char)ch;
-			tui->index_jump_buf[tui->index_jump_len] = '\0';
-		}
+	if (handle_file_cmd_input(tui, ch)) {
 		return;
 	}
 
-	if (ch != 'g' && tui->index_jump_len > 0) {
-		tui->index_jump_len = 0;
-		tui->index_jump_buf[0] = '\0';
+	if (tui->file_cmd_len > 0) {
+		if (tui->file_cmd_buf[0] == '.') {
+			file_cmd_clear(tui);
+		} else if (ch != 'g') {
+			file_cmd_clear(tui);
+		}
 	}
 
 	switch (ch) {
+	case 27:
+		if (tui->visual_mode) {
+			tui->visual_mode = 0;
+		}
+		break;
+
 	case 'j': case KEY_DOWN:
 		files_select_next(&tui->files);
 		if (tui->visual_mode && tui->files.entry_count > 0) {
@@ -1486,7 +1777,7 @@ void tui_handle_files_input(TUI *tui, int ch) {
 		break;
 
 	case 'h': case KEY_LEFT:
-		files_change_dir(&tui->files, "..");
+		files_change_dir_tracked(tui, "..");
 		break;
 
 	case 'l': case KEY_RIGHT:
@@ -1494,28 +1785,28 @@ void tui_handle_files_input(TUI *tui, int ch) {
 		if (tui->files.entry_count == 0) { break; }
 		e = &tui->files.entries[tui->files.selected];
 		if (e->type == ENTRY_DIR) {
-			files_change_dir(&tui->files, e->name);
+			files_change_dir_tracked(tui, e->name);
 		} else {
 			files_open_selected(&tui->files, &tui->shell, tui->files_win, tui->shell_win);
 		}
 		break;
 
 	case 'g':
-		if (tui->index_jump_len > 0) {
-			idx = (int)strtol(tui->index_jump_buf, &endp, 10);
-			if (idx > tui->files.entry_count) {
-				print_to_shell(&tui->shell, "Jump index is higher then the file buffer!\n", 3);
-			}
-			tui->index_jump_len = 0;
-			tui->index_jump_buf[0] = '\0';
-			if (*endp == '\0' && idx > 0) {
+		if (tui->file_cmd_len > 0 && tui->file_cmd_buf[0] != '.') {
+			errno = 0;
+			idx = strtol(tui->file_cmd_buf, &endp, 10);
+			file_cmd_clear(tui);
+			if (errno == 0 && *endp == '\0' && idx > 0 && idx <= tui->files.entry_count) {
 				for (int i = 0; i < tui->files.entry_count; i++) {
 					if (tui->files.entries[i].index != idx) { continue; }
 					tui->files.selected = i;
 					break;
 				}
+			} else if (idx > tui->files.entry_count) {
+				print_to_shell(&tui->shell, "Jump index is higher then the file buffer!\n", 3);
 			}
 		} else {
+			file_cmd_clear(tui);
 			goto_begin(tui);
 		}
 		break;
@@ -1582,75 +1873,46 @@ void tui_handle_files_input(TUI *tui, int ch) {
 		break;
 
 	case 'p':
-		if (tui->files.move_reg.count > 0) {
-			move_paste_confirm(tui);
-			refresh_files_buffer(&tui->files);
+		move_paste_confirm(tui, tui->files.cwd);
+		refresh_files_buffer(&tui->files);
+		break;
+
+	case 0x10:
+		tui->preview_mode = !tui->preview_mode;
+		if (tui->preview_mode) {
+			tui->preview_saved_col_offset = tui->files.col_offset;
 		} else {
-			tui->preview_mode = !tui->preview_mode;
-			if (tui->preview_mode) {
-				tui->preview_saved_col_offset = tui->files.col_offset;
-			} else {
-				tui->files.col_offset = tui->preview_saved_col_offset;
-				if (tui->active_buffer == BUFFER_PREVIEW) {
-					tui->active_buffer = BUFFER_FILES;
-				}
+			tui->files.col_offset = tui->preview_saved_col_offset;
+			if (tui->active_buffer == BUFFER_PREVIEW) {
+				tui->active_buffer = BUFFER_FILES;
 			}
 		}
 		break;
 
 	case 'P':
-		if (tui->files.entry_count > 0) {
-			DirEntry *e = &tui->files.entries[tui->files.selected];
-			if (e->type == ENTRY_DIR && tui->files.move_reg.count > 0) {
-				char dest[PATH_MAX];
+		if (tui->files.entry_count > 0 && tui->files.move_reg.count > 0) {
+			e = &tui->files.entries[tui->files.selected];
+			if (e->type == ENTRY_DIR) {
 				path_join(dest, PATH_MAX, tui->files.cwd, e->name);
-				// Ask for confirmation before pasting
-				char body[128];
-				snprintf(body, sizeof(body), "Move %d file(s) to '%s'?", tui->files.move_reg.count, dest);
-				int w_width = (int)strlen(body) + 6;
-				if (w_width < 46) w_width = 46;
-				int w_height = 5;
-				int w_y = (tui->max_y - w_height) / 2;
-				int w_x = (tui->max_x - w_width) / 2;
-				if (w_y < 0) w_y = 0;
-				if (w_x < 0) w_x = 0;
-				WINDOW *popup = newwin(w_height, w_width, w_y, w_x);
-				if (!popup) break;
-				wbkgd(popup, COLOR_PAIR(1));
-				wattron(popup, COLOR_PAIR(1) | A_BOLD);
-				box(popup, 0, 0);
-				wattroff(popup, COLOR_PAIR(1) | A_BOLD);
-				wattron(popup, COLOR_PAIR(1) | A_BOLD);
-				mvwprintw(popup, 1, 2, "%s", body);
-				wattroff(popup, COLOR_PAIR(1) | A_BOLD);
-				wattron(popup, COLOR_PAIR(1) | A_DIM);
-				mvwaddstr(popup, w_height - 2, 2, "[y] confirm   [n / Esc] cancel");
-				wattroff(popup, COLOR_PAIR(1) | A_DIM);
-				wnoutrefresh(popup);
-				doupdate();
-				keypad(popup, TRUE);
-				set_escdelay(25);
-				int confirmed = 0;
-				int ch;
-				while (1) {
-					ch = wgetch(popup);
-					if (ch == 'y' || ch == 'Y') { confirmed = 1; break; }
-					if (ch == 'n' || ch == 'N' || ch == 27) { break; }
-				}
-				delwin(popup);
-				if (confirmed) {
-					files_move_paste(&tui->files, &tui->shell, dest);
-					refresh_files_buffer(&tui->files);
-				}
-				clearok(curscr, TRUE);
-				touchwin(tui->files_win);
-				touchwin(tui->shell_win);
+				move_paste_confirm(tui, dest);
+				refresh_files_buffer(&tui->files);
 			}
 		}
 		break;
 	}
 }
 
+/**
+ * @brief Handles input while the shell pane is focused.
+ *
+ * When rm_confirm_mode is active, Enter commits the typed answer and
+ * executes the pending command If confirmed.
+ * Tab triggers tab-completion, and all other
+ * keys are forwarded to shell_handle_char().
+ *
+ * @param tui The TUI instance.
+ * @param ch  ncurses key value.
+ */
 void tui_handle_shell_input(TUI *tui, int ch) {
 	char ans;
 
@@ -1660,8 +1922,8 @@ void tui_handle_shell_input(TUI *tui, int ch) {
 			memset(tui->shell.current_input, 0, SHELL_MAX_INPUT);
 			tui->shell.input_pos = 0;
 			if (ans == 'y' || ans == 'Y') {
-				strncpy(tui->shell.current_input, tui->shell.rm_pending_cmd, SHELL_MAX_INPUT - 1);
-				tui->shell.current_input[SHELL_MAX_INPUT - 1] = '\0';
+				snprintf(tui->shell.current_input, sizeof(tui->shell.current_input), "%s",
+				         tui->shell.rm_pending_cmd);
 				tui->shell.input_pos = (int)strlen(tui->shell.current_input);
 				execute_given(&tui->shell, &tui->files, tui->files_win, tui->shell_win);
 				if (tui->shell.quit_requested) { tui->running = 0; return; }
@@ -1696,6 +1958,16 @@ void tui_handle_shell_input(TUI *tui, int ch) {
 	shell_handle_char(&tui->shell, ch);
 }
 
+/**
+ * @brief Top-level input dispatcher.
+ *
+ * Handles global keys.
+ * Delegates to the focused pane's handler for everything else. Input is
+ * silently discarded if the terminal is below the minimum size.
+ *
+ * @param tui The TUI instance.
+ * @param ch  ncurses key value.
+ */
 void tui_handle_input(TUI *tui, int ch) {
 	if (tui->max_x < MIN_COLS || tui->max_y < MIN_ROWS) {
 		if (ch == 'q' || ch == 'Q') { tui->running = 0; }

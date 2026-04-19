@@ -9,7 +9,10 @@
 #include "shell.h"
 
 static const char *lookup_label(const char *cmd);
+static void strncpy_safe(char *dst, size_t dst_size, const char *src);
+static void copy_span(char *dst, size_t dst_size, const char *src, size_t len);
 static void jumplist_push(ShellBuffer *shell, const char *path);
+static void debug_print_jumplist(ShellBuffer *shell);
 static void do_spawn(const char *cwd, WINDOW *files_win, WINDOW *shell_win);
 static void run_shell(const char *cmd, const char *cwd, ShellBuffer *shell);
 static const char *parse_cd(const char *cmd);
@@ -19,8 +22,15 @@ typedef struct {
 	const char *label;
 } CmdLabel;
 
+/**
+ Command labels and ghosts for the shell (and quickshell). The label is used to match the command, and the ghost is the text shown once the label is matched. For example, if the user types "s" and the label is "s", the ghost "> stat <file/index>" will be shown after that command.
+ */
 static const CmdLabel cmd_labels[] = {
 	{ "q", "quit" },
+	{ "$jumplist", "print directory jumplist" },
+	{ "$move", "print move register" },
+	{ "$undo", "print undo stack" },
+	{ "$redo", "print redo stack" },
 	{ "swordfish", "it's my brother, no way!" },
 	{ "s", "stat <file/index>" },
 	{ NULL, NULL }
@@ -42,12 +52,37 @@ static const char *lookup_label(const char *cmd) {
 	return NULL;
 }
 
+static void strncpy_safe(char *dst, size_t dst_size, const char *src) {
+	size_t len;
+
+	if (dst_size == 0) { return; }
+	len = strlen(src);
+	if (len >= dst_size) { len = dst_size - 1; }
+	memcpy(dst, src, len);
+	dst[len] = '\0';
+}
+
+static void copy_span(char *dst, size_t dst_size, const char *src, size_t len) {
+	if (dst_size == 0) { return; }
+	if (len >= dst_size) { len = dst_size - 1; }
+	if (len > 0) {
+		memcpy(dst, src, len);
+	}
+	dst[len] = '\0';
+}
+
 static void jumplist_push(ShellBuffer *shell, const char *path) {
 	if (shell->dir_jumplist_count < DIR_JUMPLIST_MAX) {
-		strncpy(shell->dir_jumplist[shell->dir_jumplist_count], path, PATH_MAX - 1);
-		shell->dir_jumplist[shell->dir_jumplist_count][PATH_MAX - 1] = '\0';
+		strncpy_safe(shell->dir_jumplist[shell->dir_jumplist_count], PATH_MAX, path);
 		shell->dir_jumplist_count++;
 	}
+}
+
+void shell_push_dir(ShellBuffer *shell, const char *path) {
+	if (!path || path[0] == '\0') {
+		return;
+	}
+	jumplist_push(shell, path);
 }
 
 void shell_add_history(ShellBuffer *shell, const char *cmd) {
@@ -60,8 +95,7 @@ void shell_add_history(ShellBuffer *shell, const char *cmd) {
 		        (size_t)(SHELL_MAX_HIST - 1) * SHELL_MAX_INPUT);
 		shell->history_count = SHELL_MAX_HIST - 1;
 	}
-	strncpy(shell->history[shell->history_count], cmd, SHELL_MAX_INPUT - 1);
-	shell->history[shell->history_count][SHELL_MAX_INPUT - 1] = '\0';
+	strncpy_safe(shell->history[shell->history_count], SHELL_MAX_INPUT, cmd);
 	shell->history_count++;
 }
 
@@ -131,7 +165,7 @@ void shell_handle_char(ShellBuffer *shell, int ch) {
 		memmove(shell->current_input + shell->input_pos + 1,
 		        shell->current_input + shell->input_pos,
 		        (size_t)(len - shell->input_pos + 1));
-		shell->current_input[shell->input_pos++] = (char)ch;
+		shell->current_input[shell->input_pos++] = (unsigned char)ch;
 	}
 }
 
@@ -214,6 +248,60 @@ void shell_restore_ncurses(WINDOW *files_win, WINDOW *shell_win) {
 	if (shell_win) { clearok(shell_win, TRUE); touchwin(shell_win); }
 }
 
+int shell_jump_prev_dir(ShellBuffer *shell, FilesBuffer *files) {
+	const char *prev;
+	const char *slash;
+	const char *dname;
+
+	if (shell->dir_jumplist_count <= 0) {
+		return 0;
+	}
+
+	prev = shell->dir_jumplist[--shell->dir_jumplist_count];
+	slash = strrchr(prev, '/');
+	dname = (slash && slash[1] != '\0') ? slash + 1 : prev;
+	strncpy_safe(shell->last_result, sizeof(shell->last_result), dname);
+	files_load_directory(files, prev);
+	return 1;
+}
+
+static void debug_print_jumplist(ShellBuffer *shell) {
+	char display[SHELL_OUTPUT_MAX];
+	int pos;
+	int n;
+	int wrote_all;
+	int suffix_len;
+	const char *suffix;
+
+	if (shell->dir_jumplist_count <= 0) {
+		print_to_shell(shell, "[jumplist] (empty)\n", SHELL_MSG_NORMAL);
+		return;
+	}
+
+	suffix = "... truncated ...\n";
+	suffix_len = (int)strlen(suffix);
+	pos = snprintf(display, sizeof(display), "[jumplist]\n");
+	wrote_all = 1;
+	for (int i = shell->dir_jumplist_count - 1; i >= 0 && pos < (int)sizeof(display) - 1; i--) {
+		n = snprintf(display + pos, sizeof(display) - pos, "%2d. %s\n",
+		             shell->dir_jumplist_count - i, shell->dir_jumplist[i]);
+		if (n < 0 || n >= (int)sizeof(display) - pos) {
+			wrote_all = 0;
+			break;
+		}
+		pos += n;
+	}
+
+	if (!wrote_all) {
+		if (pos > (int)sizeof(display) - 1 - suffix_len) {
+			pos = (int)sizeof(display) - 1 - suffix_len;
+		}
+		snprintf(display + pos, sizeof(display) - pos, "%s", suffix);
+	}
+
+	print_to_shell(shell, display, SHELL_MSG_NORMAL);
+}
+
 static void do_spawn(const char *cwd, WINDOW *files_win, WINDOW *shell_win) {
 	const char *sh;
 	pid_t pid;
@@ -246,7 +334,7 @@ static void run_shell(const char *cmd, const char *cwd, ShellBuffer *shell) {
 	pid_t pid;
 	int total;
 	char buf[512];
-	int n;
+	ssize_t n;
 	int status;
 
 	shell->last_output[0] = '\0';
@@ -274,7 +362,7 @@ static void run_shell(const char *cmd, const char *cwd, ShellBuffer *shell) {
 
 	if (pid > 0) {
 		total = 0;
-		while ((n = (int)read(pfd[0], buf, sizeof(buf))) > 0) {
+		while ((n = read(pfd[0], buf, sizeof(buf))) > 0) {
 			if (total + n < SHELL_OUTPUT_MAX - 1) {
 				memcpy(shell->last_output + total, buf, (size_t)n);
 				total += n;
@@ -307,13 +395,11 @@ int print_to_shell(ShellBuffer *shell, const char *text, int type) {
 	} else if (type == SHELL_MSG_WARN) {
 		snprintf(formatted, sizeof(formatted), "WARN: %s", text);
 	} else {
-		strncpy(formatted, text, sizeof(formatted) - 1);
-		formatted[sizeof(formatted) - 1] = '\0';
+		strncpy_safe(formatted, sizeof(formatted), text);
 	}
 
-	shell->last_output[0] = (char)type;
-	strncpy(shell->last_output + 1, formatted, SHELL_OUTPUT_MAX - 2);
-	shell->last_output[SHELL_OUTPUT_MAX - 1] = '\0';
+	shell->last_output[0] = (unsigned char)type;
+	strncpy_safe(shell->last_output + 1, SHELL_OUTPUT_MAX - 1, formatted);
 	return 0;
 }
 
@@ -405,21 +491,33 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WIN
 		return 0;
 	}
 
+	if (strcmp(cmd, "$jumplist") == 0) {
+		debug_print_jumplist(shell);
+		return 0;
+	}
+
+	if (strcmp(cmd, "$move") == 0) {
+		files_debug_print_move_register(files, shell);
+		return 0;
+	}
+
+	if (strcmp(cmd, "$undo") == 0) {
+		files_debug_print_undo_stack(files, shell);
+		return 0;
+	}
+
+	if (strcmp(cmd, "$redo") == 0) {
+		files_debug_print_redo_stack(files, shell);
+		return 0;
+	}
+
 	if (cmd[0] == 's' && (cmd[1] == '\0' || cmd[1] == ' ')) {
 		files_cmd_stat(files, shell, cmd[1] == ' ' ? cmd + 2 : "");
 		return 0;
 	}
 
 	if (strcmp(cmd, "..") == 0) {
-		if (shell->dir_jumplist_count > 0) {
-			const char *prev = shell->dir_jumplist[--shell->dir_jumplist_count];
-			const char *slash = strrchr(prev, '/');
-			const char *dname = (slash && slash[1] != '\0') ? slash + 1 : prev;
-			strncpy(shell->last_result, dname, SHELL_RESULT_MAX - 1);
-			shell->last_result[SHELL_RESULT_MAX - 1] = '\0';
-			files_load_directory(files, prev);
-		}
-		return 1;
+		return shell_jump_prev_dir(shell, files);
 	}
 
 	idx = strtol(cmd, &endp, 10);
@@ -433,7 +531,7 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WIN
 				} else {
 					path_join(target, PATH_MAX, files->cwd, files->entries[i].name);
 				}
-				jumplist_push(shell, files->cwd);
+				shell_push_dir(shell, files->cwd);
 				strncpy(shell->last_result, files->entries[i].name, SHELL_RESULT_MAX - 1);
 				shell->last_result[SHELL_RESULT_MAX - 1] = '\0';
 				use = realpath(target, resolved) ? resolved : target;
@@ -478,7 +576,7 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WIN
 		}
 
 		use = realpath(target, resolved) ? resolved : target;
-		jumplist_push(shell, files->cwd);
+		shell_push_dir(shell, files->cwd);
 		files_load_directory(files, use);
 		return 1;
 	}
@@ -508,8 +606,7 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WIN
 
 				tok_len = (int)(tok_end - scan);
 				if (tok_len >= MAX_FILENAME) { tok_len = MAX_FILENAME - 1; }
-				strncpy(token, scan, tok_len);
-				token[tok_len] = '\0';
+				copy_span(token, sizeof(token), scan, (size_t)tok_len);
 
 				was_quoted = 0;
 				if (tok_len >= 2 && token[0] == '\'' && token[tok_len - 1] == '\'') {
@@ -552,8 +649,7 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WIN
 				snprintf(display + dlen, sizeof(display) - dlen, "Continue? [y/N]");
 				print_to_shell(shell, display, 1);
 				shell->rm_confirm_mode = 1;
-				strncpy(shell->rm_pending_cmd, cmd, SHELL_MAX_INPUT - 1);
-				shell->rm_pending_cmd[SHELL_MAX_INPUT - 1] = '\0';
+				strncpy_safe(shell->rm_pending_cmd, SHELL_MAX_INPUT, cmd);
 				return 0;
 			}
 		} else {
@@ -566,8 +662,7 @@ int execute_given(ShellBuffer *shell, FilesBuffer *files, WINDOW *files_win, WIN
 
 				tok_len = (int)(tok_end - arg);
 				if (tok_len >= MAX_FILENAME) { tok_len = MAX_FILENAME - 1; }
-				strncpy(token, arg, tok_len);
-				token[tok_len] = '\0';
+				copy_span(token, sizeof(token), arg, (size_t)tok_len);
 
 				was_quoted = 0;
 				if (tok_len >= 2 && token[0] == '\'' && token[tok_len - 1] == '\'') {

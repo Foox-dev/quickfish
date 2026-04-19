@@ -8,7 +8,7 @@
 
 #define MAX_FILENAME 256
 #define MAX_FILES 1000
-#define UNDO_MAX 10
+#define UNDO_MAX 50
 #define MOVE_REGISTER_MAX MAX_FILES
 
 typedef struct {
@@ -25,6 +25,7 @@ typedef enum {
 	OP_RENAME,
 	OP_TRASH,
 	OP_DELETE_PERM,
+	OP_MOVE,
 } OpType;
 
 typedef struct {
@@ -37,9 +38,10 @@ typedef struct {
 
 typedef struct {
 	OpType type;
-	char cwd[PATH_MAX];
+	int batch_id;
 	char old_name[MAX_FILENAME];
 	char new_name[MAX_FILENAME];
+	char cwd[PATH_MAX];
 	char trash_path[PATH_MAX];
 } UndoOp;
 
@@ -50,6 +52,7 @@ typedef struct {
 	int sel_count;
 	int undo_top;
 	int redo_top;
+	int move_batch_id;
 	char cwd[PATH_MAX];
 	DirEntry entries[MAX_FILES];
 	int multi_sel[MAX_FILES];
@@ -86,9 +89,15 @@ void files_delete_to_trash(FilesBuffer *files, struct ShellBuffer *shell);
 void files_delete_permanent(FilesBuffer *files, struct ShellBuffer *shell);
 void files_undo(FilesBuffer *files, struct ShellBuffer *shell);
 void files_redo(FilesBuffer *files, struct ShellBuffer *shell);
+void files_debug_print_undo_stack(FilesBuffer *files, struct ShellBuffer *shell);
+void files_debug_print_redo_stack(FilesBuffer *files, struct ShellBuffer *shell);
 int files_build_sel_args(FilesBuffer *files, char *out, int out_size);
 
 void files_move_mark(FilesBuffer *files, struct ShellBuffer *shell, int idx);
 void files_move_mark_all(FilesBuffer *files, struct ShellBuffer *shell);
 void files_move_clear(FilesBuffer *files, struct ShellBuffer *shell);
 void files_move_paste(FilesBuffer *files, struct ShellBuffer *shell, const char *dest);
+void files_debug_print_move_register(FilesBuffer *files, struct ShellBuffer *shell);
+void push_undo(FilesBuffer *files, UndoOp op);
+
+extern volatile int needs_resize;

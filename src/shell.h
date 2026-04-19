@@ -34,9 +34,11 @@ typedef struct ShellBuffer {
 void shell_add_history(ShellBuffer *shell, const char *cmd);
 void shell_handle_char(ShellBuffer *shell, int ch);
 void shell_tab_complete(ShellBuffer *shell, const char *cwd);
+void shell_push_dir(ShellBuffer *shell, const char *path);
 void shell_restore_ncurses(WINDOW *files_win, WINDOW *shell_win);
 int execute_given(ShellBuffer *shell, FilesBuffer *files,
                   WINDOW *files_win, WINDOW *shell_win);
+int shell_jump_prev_dir(ShellBuffer *shell, FilesBuffer *files);
 void shell_render(ShellBuffer *shell, WINDOW *win, int height,
                   int focused, const char *cwd, const FilesBuffer *files);
 
