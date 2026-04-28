@@ -1,7 +1,7 @@
 CC ?= gcc
 override CFLAGS_DEV = -Wall -Wextra -g -std=gnu11 -MMD -MP
 override CFLAGS_REL = -Wall -Wextra -Werror -O3 -std=gnu11 -MMD -MP
-LDLIBS = -lncurses -lpanel
+LDLIBS = -lncurses -lpanel -ltinfo
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
 DEV_BUILDDIR = build
